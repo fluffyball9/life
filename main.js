@@ -74,7 +74,7 @@ var
         loaded = false,
 
 
-        life = new LifeUniverse(),
+        life,
         drawer = new LifeCanvasDrawer(),
 
         // example setups which are run at startup
@@ -97,7 +97,7 @@ var
         setTimeout;
 
     // setup
-    window.onload = function()
+    window.onload = async function()
     {
         if(loaded)
         {
@@ -119,6 +119,12 @@ var
         init_ui();
 
         drawer.set_size(window.innerWidth, document.body.offsetHeight);
+
+        // Initialize the wasm module
+        await wasm_bindgen();
+
+        life = new wasm_bindgen.LifeUniverse();
+
         reset_settings();
 
         // This gets called, when a pattern is loaded.
@@ -330,7 +336,7 @@ var
             {
                 drawer.set_size(window.innerWidth, document.body.offsetHeight);
 
-                requestAnimationFrame(lazy_redraw.bind(0, life.root));
+                requestAnimationFrame(lazy_redraw.bind(0, life));
             }, 500);
 
             $("gen_step").onchange = function(e)
@@ -398,20 +404,20 @@ var
                     update_hud();
 
                     drawer.center_view();
-                    drawer.redraw(life.root);
+                    drawer.redraw(life);
                 });
             };
 
             $("rewind_button").onclick = function()
             {
-                if(life.rewind_state)
+                if(life.has_rewind_state())
                 {
                     stop(function()
                     {
                         life.restore_rewind_state();
 
                         fit_pattern();
-                        drawer.redraw(life.root);
+                        drawer.redraw(life);
 
                         update_hud();
                     });
@@ -422,7 +428,7 @@ var
             //{
             //    drawer.zoom_at(false, e.clientX, e.clientY);
             //    update_hud();
-            //    lazy_redraw(life.root);
+            //    lazy_redraw(life);
             //    return false;
             //};
 
@@ -456,7 +462,7 @@ var
                             requestAnimationFrame(redraw);
                         }
 
-                        lazy_redraw(life.root);
+                        lazy_redraw(life);
                     })();
                 }
 
@@ -523,7 +529,7 @@ var
                     if(changed)
                     {
                         update_hud();
-                        lazy_redraw(life.root);
+                        lazy_redraw(life);
                     }
                 }
                 else
@@ -581,7 +587,7 @@ var
                 drawer.zoom_at((e.wheelDelta || -e.detail) < 0, e.clientX, e.clientY);
 
                 update_hud();
-                lazy_redraw(life.root);
+                lazy_redraw(life);
                 return false;
             };
 
@@ -670,7 +676,7 @@ var
                 else if(chr === 219 || chr === 221)
                 {
                     // [ ]
-                    var step = life.step;
+                    var step = life.get_step();
 
                     if(chr === 219)
                         step--;
@@ -688,7 +694,7 @@ var
 
                 if(do_redraw)
                 {
-                    lazy_redraw(life.root);
+                    lazy_redraw(life);
 
                     return false;
                 }
@@ -698,7 +704,7 @@ var
 
             $("faster_button").onclick = function()
             {
-                var step = life.step + 1;
+                var step = life.get_step() + 1;
 
                 life.set_step(step);
                 set_text($("label_step"), Math.pow(2, step));
@@ -706,9 +712,9 @@ var
 
             $("slower_button").onclick = function()
             {
-                if(life.step > 0)
+                if(life.get_step() > 0)
                 {
-                    var step = life.step - 1;
+                    var step = life.get_step() - 1;
 
                     life.set_step(step);
                     set_text($("label_step"), Math.pow(2, step));
@@ -725,27 +731,27 @@ var
             {
                 drawer.zoom_centered(false);
                 update_hud();
-                lazy_redraw(life.root);
+                lazy_redraw(life);
             };
 
             $("zoomout_button").onclick = function()
             {
                 drawer.zoom_centered(true);
                 update_hud();
-                lazy_redraw(life.root);
+                lazy_redraw(life);
             };
 
             $("initial_pos_button").onclick = function()
             {
                 fit_pattern();
-                lazy_redraw(life.root);
+                lazy_redraw(life);
                 update_hud();
             };
 
             $("middle_button").onclick = function()
             {
                 drawer.center_view();
-                lazy_redraw(life.root);
+                lazy_redraw(life);
             };
 
             var positions = [
@@ -768,7 +774,7 @@ var
                     return function()
                     {
                         drawer.move(info[1] * -30, info[2] * -30);
-                        lazy_redraw(life.root);
+                        lazy_redraw(life);
                     };
                 })(positions[i]);
 
@@ -862,16 +868,14 @@ var
                             field_y[i] = Math.random() * height;
                         }
 
-                        var bounds = life.get_bounds(field_x, field_y);
-                        life.make_center(field_x, field_y, bounds);
-                        life.setup_field(field_x, field_y, bounds);
+                        life.setup_field(field_x, field_y);
 
                         life.save_rewind_state();
 
                         hide_overlay();
 
                         fit_pattern();
-                        lazy_redraw(life.root);
+                        lazy_redraw(life);
 
                         update_hud();
 
@@ -936,14 +940,14 @@ var
 
                 $("toolbar").style.color = drawer.background_color;
 
-                lazy_redraw(life.root);
+                lazy_redraw(life);
             };
 
             $("settings_reset").onclick = function()
             {
                 reset_settings();
 
-                lazy_redraw(life.root);
+                lazy_redraw(life);
 
                 hide_overlay();
             };
@@ -954,7 +958,7 @@ var
 
                 $("rule").value = formats.rule2str(life.rule_s, life.rule_b);
                 $("max_fps").value = max_fps;
-                $("gen_step").value = Math.pow(2, life.step);
+                $("gen_step").value = Math.pow(2, life.get_step());
 
                 $("border_width").value = drawer.border_width;
                 //$("cell_color").value = drawer.cell_color;
@@ -1146,8 +1150,7 @@ var
         drawer.border_width = DEFAULT_BORDER;
         drawer.cell_width = 2;
 
-        life.rule_b = 1 << 3;
-        life.rule_s = 1 << 2 | 1 << 3;
+        life.set_rules(1 << 2 | 1 << 3, 1 << 3);
         life.set_step(0);
         set_text($("label_step"), "1");
 
@@ -1204,12 +1207,11 @@ var
 
             if(!is_mc)
             {
-                var bounds = life.get_bounds(result.field_x, result.field_y);
-                life.make_center(result.field_x, result.field_y, bounds);
-                life.setup_field(result.field_x, result.field_y, bounds);
+                life.setup_field(result.field_x, result.field_y);
             }
             else
             {
+                throw new UnsupportedFeatureError("Macrocell loading is not supported yet.");
                 result = load_macrocell(life, pattern_text);
                 const step = 15;
                 life.set_step(step);
@@ -1230,7 +1232,7 @@ var
             hide_overlay();
 
             fit_pattern();
-            drawer.redraw(life.root);
+            drawer.redraw(life);
 
             update_hud();
             set_text($("pattern_name"), result.title || "no name");
@@ -1263,6 +1265,13 @@ var
     {
         var bounds = life.get_root_bounds();
 
+        bounds = {
+            left: bounds[0],
+            right: bounds[1],
+            top: bounds[2],
+            bottom: bounds[3],
+        }
+
         drawer.fit_bounds(bounds);
     }
 
@@ -1282,7 +1291,7 @@ var
         life.setup_meta(otca_on, otca_off, field, bounds);
 
         update_hud();
-        drawer.redraw(life.root);
+        drawer.redraw(life);
     }*/
 
     function run()
@@ -1298,7 +1307,7 @@ var
 
         running = true;
 
-        if(life.generation === 0)
+        if(life.get_generation() === 0)
         {
             life.save_rewind_state();
         }
@@ -1329,7 +1338,7 @@ var
             if(per_frame * n < (time - start))
             {
                 life.next_generation(true);
-                drawer.redraw(life.root);
+                drawer.redraw(life);
 
                 n++;
 
@@ -1353,13 +1362,13 @@ var
     {
         var time = Date.now();
 
-        if(life.generation === 0)
+        if(life.get_generation() === 0)
         {
             life.save_rewind_state();
         }
 
         life.next_generation(is_single);
-        drawer.redraw(life.root);
+        drawer.redraw(life);
 
         update_hud(1000 / (Date.now() - time));
 
@@ -1452,10 +1461,10 @@ var
             set_text($("label_fps"), fps.toFixed(1));
         }
 
-        set_text($("label_gen"), format_thousands(life.generation, "\u202f"));
+        set_text($("label_gen"), format_thousands(life.get_generation(), "\u202f"));
         fix_width($("label_gen"));
 
-        set_text($("label_pop"), format_thousands(life.root.population, "\u202f"));
+        set_text($("label_pop"), format_thousands(life.get_population(), "\u202f"));
         fix_width($("label_pop"));
 
         if(drawer.cell_width >= 1)
@@ -1600,7 +1609,7 @@ var
 
             drawer.move(dx, dy);
 
-            //lazy_redraw(life.root);
+            //lazy_redraw(life);
 
             last_mouse_x += dx;
             last_mouse_y += dy;

@@ -1,0 +1,943 @@
+use std::cell::Cell;
+use std::mem::{self, MaybeUninit};
+use std::rc::Rc;
+use wasm_bindgen::prelude::wasm_bindgen;
+
+const LOAD_FACTOR: f64 = 0.9;
+const INITIAL_SIZE: usize = 20;
+const HASHMAP_LIMIT: usize = 24;
+const MASK_LEFT: usize = 1;
+const MASK_TOP: usize = 2;
+const MASK_RIGHT: usize = 4;
+const MASK_BOTTOM: usize = 8;
+
+type WrappedTreeNode = Rc<TreeNode>;
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console)]
+    fn log(s: &str);
+}
+
+#[repr(C)]
+struct TreeNodeMaybeUninit {
+    nw: MaybeUninit<Rc<TreeNodeMaybeUninit>>,
+    ne: MaybeUninit<Rc<TreeNodeMaybeUninit>>,
+    sw: MaybeUninit<Rc<TreeNodeMaybeUninit>>,
+    se: MaybeUninit<Rc<TreeNodeMaybeUninit>>,
+    id: Cell<usize>,
+    population: usize,
+    level: usize,
+    cache: Cell<Option<Rc<TreeNodeMaybeUninit>>>,
+    quick_cache: Cell<Option<Rc<TreeNodeMaybeUninit>>>
+}
+
+#[repr(C)]
+struct TreeNode {
+    nw: WrappedTreeNode,
+    ne: WrappedTreeNode,
+    sw: WrappedTreeNode,
+    se: WrappedTreeNode,
+    id: Cell<usize>,
+    population: usize,
+    level: usize,
+    cache: Cell<Option<WrappedTreeNode>>,
+    quick_cache: Cell<Option<WrappedTreeNode>>
+}
+
+#[derive(Clone)]
+struct HashMapNode {
+    node: WrappedTreeNode,
+    next: Option<Box<HashMapNode>>
+}
+
+impl PartialEq for TreeNode {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl TreeNode {
+    pub fn new(nw: WrappedTreeNode, ne: WrappedTreeNode, sw: WrappedTreeNode, se: WrappedTreeNode, id: usize) -> WrappedTreeNode {
+        let mut new_node = Self {
+            nw: nw,
+            ne: ne,
+            sw: sw,
+            se: se,
+            id: Cell::new(id),
+            population: 0,
+            level: 0,
+            cache: Cell::new(None),
+            quick_cache: Cell::new(None)
+        };
+        new_node.level = new_node.nw.level + 1;
+        // log(format!("Creating new node with level: {} and id: {}", new_node.level, id).as_str());
+        new_node.population = new_node.nw.population + new_node.ne.population + new_node.sw.population + new_node.se.population;
+        Rc::new(new_node)
+    }
+
+    pub fn new_leaf(id: usize, population: usize) -> WrappedTreeNode {
+        // log("Creating new leaf...");
+        let new_leaf = Rc::into_raw(Rc::new(TreeNodeMaybeUninit {
+            nw: MaybeUninit::uninit(),
+            ne: MaybeUninit::uninit(),
+            sw: MaybeUninit::uninit(),
+            se: MaybeUninit::uninit(),
+            id: Cell::new(id),
+            population: population,
+            level: 0,
+            cache: Cell::new(None),
+            quick_cache: Cell::new(None)
+        })) as *mut TreeNodeMaybeUninit;
+        let new_leaf = unsafe {
+            (*new_leaf).nw = MaybeUninit::new(Rc::from_raw(new_leaf));
+            (*new_leaf).ne = MaybeUninit::new(Rc::from_raw(new_leaf));
+            (*new_leaf).sw = MaybeUninit::new(Rc::from_raw(new_leaf));
+            (*new_leaf).se = MaybeUninit::new(Rc::from_raw(new_leaf));
+
+            mem::transmute::<_, WrappedTreeNode>(Rc::from_raw(new_leaf))
+        };
+        debug_assert!(new_leaf.get_cache() == None, "Cache is not None");
+        debug_assert!(new_leaf.get_quick_cache() == None, "Quick cache is not None");
+        debug_assert_eq!(new_leaf.id.get(), id);
+        debug_assert_eq!(new_leaf.population, population);
+        debug_assert_eq!(new_leaf.level, 0);
+        new_leaf
+    }
+
+    pub fn get_cache(&self) -> Option<WrappedTreeNode> {
+        let cached = self.cache.take();
+        self.cache.set(cached.clone());
+        cached
+    }
+
+    pub fn get_quick_cache(&self) -> Option<WrappedTreeNode> {
+        let cached = self.quick_cache.take();
+        self.quick_cache.set(cached.clone());
+        cached
+    }
+}
+
+struct Bounds {
+    left: i32,
+    right: i32,
+    top: i32,
+    bottom: i32
+}
+
+#[wasm_bindgen]
+struct LifeUniverse {
+    last_id: usize,
+    hashmap_size: usize,
+    max_load: usize,
+    hashmap: Vec<Option<Box<HashMapNode>>>,
+    empty_tree_cache: Vec<Option<WrappedTreeNode>>,
+    level2_cache: Vec<Option<WrappedTreeNode>>,
+    rule_b: usize,
+    rule_s: usize,
+    root: WrappedTreeNode,
+    rewind_state: Option<WrappedTreeNode>,
+    step: usize,
+    generation: f64,
+    false_leaf: WrappedTreeNode,
+    true_leaf: WrappedTreeNode,
+    _powers: Vec<f64>
+}
+
+#[wasm_bindgen]
+impl LifeUniverse {
+    fn in_hashmap(&self, n: WrappedTreeNode) -> bool {
+        let hash = Self::calc_hash(n.nw.id.get(), n.ne.id.get(), n.sw.id.get(), n.se.id.get()) & self.hashmap_size;
+        let mut node = &self.hashmap[hash];
+
+        while let Some(x) = node {
+            if n == x.node {
+                return true;
+            }
+            node = &x.next;
+        }
+        false
+    }
+
+    fn node_hash(&mut self, node: WrappedTreeNode) {
+        if !self.in_hashmap(node.clone()) {
+            node.id.set(self.last_id);
+            self.last_id += 1;
+
+            if node.level > 1 {
+                self.node_hash(node.nw.clone());
+                self.node_hash(node.ne.clone());
+                self.node_hash(node.sw.clone());
+                self.node_hash(node.se.clone());
+
+                if let Some(cached) = node.get_cache() {
+                    self.node_hash(cached);
+                }
+
+                if let Some(cached) = node.get_quick_cache() {
+                    self.node_hash(cached);
+                }
+            }
+
+            self.hashmap_insert(node.clone());
+        }
+    }
+    
+
+    fn reset_caches(&mut self) {
+        self.empty_tree_cache.fill(None);
+        self.level2_cache.fill(None);
+    }
+
+    fn garbage_collect(&mut self) {
+        // log(format!("Garbage collecting..., current hs_size: {}, last_id: {}", self.hashmap_size, self.last_id).as_str());
+        if self.hashmap_size < (1 << HASHMAP_LIMIT) - 1 {
+            self.hashmap_size = self.hashmap_size << 1 | 1;
+            self.hashmap = vec![None; self.hashmap_size+1];
+        } else {
+            self.hashmap.fill(None);
+        }
+        
+        self.max_load = (self.hashmap_size as f64 * LOAD_FACTOR) as usize;
+        self.last_id = 4;
+        self.node_hash(self.root.clone());
+
+        // log(format!("Garbage collection done..., new hs_size: {}, last_id: {}", self.hashmap_size, self.last_id).as_str());
+    }
+
+    fn calc_hash(nw: usize, ne: usize, sw: usize, se: usize) -> usize {
+        ((nw.overflowing_mul(23).0 ^ ne).overflowing_mul(23).0 ^ sw).overflowing_mul(23).0 ^ se
+    }
+
+    fn create_tree(&mut self, nw: WrappedTreeNode, ne: WrappedTreeNode, sw: WrappedTreeNode, se: WrappedTreeNode) -> WrappedTreeNode {
+        debug_assert_eq!(nw.level, ne.level);
+        debug_assert_eq!(nw.level, sw.level);
+        debug_assert_eq!(nw.level, se.level);
+        let hash = Self::calc_hash(nw.id.get(), ne.id.get(), sw.id.get(), se.id.get()) & self.hashmap_size;
+        // log(format!("Creating tree... Hash: {}", hash).as_str());
+        let mut node = &mut self.hashmap[hash];
+
+        while let Some(n) = node {
+            if n.node.nw == nw && n.node.ne == ne && n.node.sw == sw && n.node.se == se {
+                // log("Create Tree: Tree already exists...");
+                return n.node.clone();
+            }
+            node = &mut n.next;
+        }
+
+        if self.last_id > self.max_load {
+            self.garbage_collect();
+            return self.create_tree(nw, ne, sw, se);
+        }
+
+        let new_node = HashMapNode {
+            node: TreeNode::new(nw, ne, sw, se, self.last_id),
+            next: None
+        };
+        self.last_id += 1;
+
+        node.insert(Box::new(new_node)).node.clone()
+    }
+
+    fn empty_tree(&mut self, level: usize) -> WrappedTreeNode {
+        if self.empty_tree_cache.len() <= level {
+            self.empty_tree_cache.resize(level + 1, None);
+        } else if let Some(cached) = &self.empty_tree_cache[level] {
+            return cached.clone();
+        }
+
+        let t = if level == 1 { self.false_leaf.clone() } else { self.empty_tree(level - 1) };
+
+        // log(format!("Level of t is: {}", t.level).as_str());
+
+        let empty_tree = self.create_tree(t.clone(), t.clone(), t.clone(), t);
+
+        // log(format!("Empty tree requested level of: {}", level).as_str());
+        // log(format!("Empty tree created level of: {}", empty_tree.level).as_str());
+
+        self.empty_tree_cache[level].insert(empty_tree).clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_pattern(&mut self) {
+        self.last_id = 4;
+        self.hashmap_size = (1 << INITIAL_SIZE) - 1;
+        self.max_load = (self.hashmap_size as f64 * LOAD_FACTOR) as usize;
+        self.hashmap = vec![None; self.hashmap_size+1];
+        self.empty_tree_cache.fill(None);
+        self.level2_cache = vec![None; 0x10000];
+        self.root = self.empty_tree(3);
+        self.generation = 0.0;
+        // log("Clearing pattern...");
+    }
+
+    #[wasm_bindgen(constructor)]
+    #[allow(dead_code)]
+    pub fn new() -> LifeUniverse {
+        // log("Starting constructor...");
+        let mut powers = vec![0.0; 1024];
+        powers[0] = 1.0;
+        for i in 1..1024 {
+            powers[i] = powers[i - 1] * 2.0;
+        }
+        // log("Creating object...");
+        let false_leaf = TreeNode::new_leaf(3, 0);
+        let true_leaf = TreeNode::new_leaf(2, 1);
+        let mut ret = LifeUniverse {
+            last_id: 0,
+            hashmap_size: 0,
+            max_load: 0,
+            hashmap: vec![],
+            empty_tree_cache: vec![],
+            level2_cache: vec![],
+            root: true_leaf.clone(),
+            generation: 0.0,
+            rule_b: 1 << 3,
+            rule_s: 1 << 2 | 1 << 3,
+            rewind_state: None,
+            step: 0,
+            false_leaf: false_leaf,
+            true_leaf: true_leaf,
+            _powers: powers
+        };
+        // log("Clearing pattern...");
+        ret.clear_pattern();
+        // log("Done clearing patter...");
+        ret
+    }
+
+    fn pow2(&self, x: usize) -> f64 {
+        if x >= 1024 {
+            return f64::INFINITY;
+        }
+        self._powers[x as usize]
+    }
+
+    #[allow(dead_code)]
+    pub fn save_rewind_state(&mut self) {
+        self.rewind_state = Some(self.root.clone());
+    }
+
+    #[allow(dead_code)]
+    pub fn restore_rewind_state(&mut self) {
+        if let Some(rewind_state) = &self.rewind_state {
+            self.generation = 0.0;
+            self.root = rewind_state.clone();
+
+            self.garbage_collect();
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn has_rewind_state(&self) -> bool {
+        self.rewind_state.is_some()
+    }
+
+    fn eval_mask(&self, mask: usize) -> usize {
+        let rule = if mask & 32 != 0  { self.rule_s } else { self.rule_b };
+
+        rule >> (mask & 0x757).count_ones() & 1
+    }
+
+    fn level1_create(&mut self, mask: usize) -> WrappedTreeNode {
+        self.create_tree(
+            if mask & 1 != 0 { self.true_leaf.clone() } else {self.false_leaf.clone() },
+            if mask & 2 != 0 { self.true_leaf.clone() } else { self.false_leaf.clone() },
+            if mask & 4 != 0 { self.true_leaf.clone() } else { self.false_leaf.clone() },
+            if mask & 8 != 0 { self.true_leaf.clone() } else { self.false_leaf.clone() }
+        )
+    }
+
+    fn get_level_from_bounds(&self, bounds: Vec<f64>) -> usize {
+        let mut max = 4.0;
+        
+        for coordinate in bounds {
+            if coordinate + 1.0 > max {
+                max = coordinate + 1.0;
+            } else if-coordinate > max {
+                max = -coordinate;
+            }
+        }
+
+        max.log2().ceil() as usize + 1
+    }
+
+    fn node_set_bit(&mut self, node: WrappedTreeNode, x: f64, y: f64, living: bool) -> WrappedTreeNode {
+        if node.level == 0 {
+            return if living { self.true_leaf.clone() } else { self.false_leaf.clone() };
+        }
+
+        let offset = if node.level == 1 { 0.0 } else { self.pow2(node.level - 2) };
+        let mut nw = node.nw.clone();
+        let mut ne = node.ne.clone();
+        let mut sw = node.sw.clone();
+        let mut se = node.se.clone();
+
+        if x < 0.0 {
+            if y < 0.0 {
+                nw = self.node_set_bit(nw, x + offset, y + offset, living);
+            } else {
+                sw = self.node_set_bit(sw, x + offset, y - offset, living);
+            }
+        } else {
+            if y < 0.0 {
+                ne = self.node_set_bit(ne, x - offset, y + offset, living);
+            } else {
+                se = self.node_set_bit(se, x - offset, y - offset, living);
+            }
+        }
+
+        self.create_tree(nw, ne, sw, se)
+    }
+
+    fn node_get_bit(&self, node: WrappedTreeNode, x: f64, y: f64) -> bool {
+        if node.population == 0 {
+            return false;
+        }
+        if node.level == 0 {
+            // other level 0 case handled above
+            return true;
+        }
+
+        let offset = if node.level == 1 { 0.0 } else { self.pow2(node.level - 2) };
+
+        if x < 0.0 {
+            if y < 0.0 {
+                self.node_get_bit(node.nw.clone(), x + offset, y + offset)
+            } else {
+                self.node_get_bit(node.sw.clone(), x + offset, y - offset)
+            }
+        } else {
+            if y < 0.0 {
+                self.node_get_bit(node.ne.clone(), x - offset, y + offset)
+            } else {
+                self.node_get_bit(node.se.clone(), x - offset, y - offset)
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn set_bit(&mut self, x: f64, y: f64, living: bool) {
+        // log(format!("Setting bit at x: {}, y: {}, living: {}", x, y, living).as_str());
+        let level = self.get_level_from_bounds(vec![x, y]);
+
+        
+        if living {
+            while level > self.root.level {
+                self.root = self.expand_universe(self.root.clone());
+            }
+        } else if level > self.root.level {
+            // no need to delete pixels outside of the universe
+            return;
+        }
+
+        self.root = self.node_set_bit(self.root.clone(), x, y, living);
+    }
+
+    #[allow(dead_code)]
+    pub fn get_bit(&self, x: f64, y: f64) -> bool {
+        let level = self.get_level_from_bounds(vec![x, y]);
+
+        if level > self.root.level {
+            return false;
+        }
+
+        self.node_get_bit(self.root.clone(), x, y)
+    }
+
+    fn node_get_boundary(&self, node: WrappedTreeNode, left: f64, top: f64, find_mask: usize, boundary: &mut Vec<f64>) {
+        if node.population == 0 || find_mask == 0 {
+            return;
+        }
+
+        if node.level == 0 {
+            if left < boundary[0] {
+                boundary[0] = left;
+            }
+            if left > boundary[1] {
+                boundary[1] = left;
+            }
+
+            if top < boundary[2] {
+                boundary[2] = top;
+            }
+            if top > boundary[3] {
+                boundary[3] = top;
+            }
+        } else {
+            let offset = self.pow2(node.level - 1);
+
+            if left >= boundary[0] && left + offset * 2.0 <= boundary[1] &&
+                top >= boundary[2] && top + offset * 2.0 <= boundary[3] {
+                // this square is already inside the found boundary
+                return;
+            }
+
+            let mut find_nw = find_mask;
+            let mut find_ne = find_mask;
+            let mut find_sw = find_mask;
+            let mut find_se = find_mask;
+
+            if node.nw.population != 0 {
+                find_sw &= !MASK_TOP;
+                find_ne &= !MASK_LEFT;
+                find_se &= !MASK_TOP & !MASK_LEFT;
+            }
+            if node.sw.population != 0 {
+                find_se &= !MASK_LEFT;
+                find_nw &= !MASK_BOTTOM;
+                find_ne &= !MASK_BOTTOM & !MASK_LEFT;
+            }
+            if node.ne.population != 0 {
+                find_nw &= !MASK_RIGHT;
+                find_se &= !MASK_TOP;
+                find_sw &= !MASK_TOP & !MASK_RIGHT;
+            }
+            if node.se.population != 0 {
+                find_sw &= !MASK_RIGHT;
+                find_ne &= !MASK_BOTTOM;
+                find_nw &= !MASK_BOTTOM & !MASK_RIGHT;
+            }
+
+            self.node_get_boundary(node.nw.clone(), left, top, find_nw, boundary);
+            self.node_get_boundary(node.sw.clone(), left, top + offset, find_sw, boundary);
+            self.node_get_boundary(node.ne.clone(), left + offset, top, find_ne, boundary);
+            self.node_get_boundary(node.se.clone(), left + offset, top + offset, find_se, boundary);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn get_root_bounds(&self) -> Vec<f64> {
+        if self.root.population == 0 {
+            return vec![0.0, 0.0, 0.0, 0.0];
+        }
+
+        let mut bounds = vec![
+            f64::INFINITY, // left
+            f64::NEG_INFINITY, // right
+            f64::INFINITY, // top
+            f64::NEG_INFINITY // bottom
+        ];
+        let offset = self.pow2(self.root.level - 1);
+
+        self.node_get_boundary(self.root.clone(), -offset, -offset, MASK_LEFT | MASK_TOP | MASK_RIGHT | MASK_BOTTOM, &mut bounds);
+
+        bounds
+    }
+
+    fn expand_universe(&mut self, node: WrappedTreeNode) -> WrappedTreeNode {
+        let level = node.level;
+        let t = self.empty_tree(level - 1);
+        let nw = self.create_tree(t.clone(), t.clone(), t.clone(), node.nw.clone());
+        let ne = self.create_tree(t.clone(), t.clone(), node.ne.clone(), t.clone());
+        let sw = self.create_tree(t.clone(), node.sw.clone(), t.clone(), t.clone());
+        let se = self.create_tree(node.se.clone(), t.clone(), t.clone(), t.clone());
+
+        self.create_tree(
+            nw,
+            ne,
+            sw,
+            se
+        )
+    }
+
+    fn uncache(&mut self, also_quick: bool) {
+        for node in &mut self.hashmap {
+            if let Some(n) = node {
+                n.node.cache.take();
+                n.next.take();
+                if also_quick {
+                    n.node.quick_cache.take();
+                }
+            }
+        }
+    }
+
+    fn hashmap_insert(&mut self, n: WrappedTreeNode) {
+        let hash = Self::calc_hash(n.nw.id.get(), n.ne.id.get(), n.sw.id.get(), n.se.id.get()) & self.hashmap_size;
+        let mut node = &mut self.hashmap[hash];
+
+        while let Some(n) = node {
+            node = &mut n.next;
+        }
+
+        let _ = node.insert(Box::new(HashMapNode {
+            node: n,
+            next: None
+        }));
+    }
+
+    fn node_level2_next(&mut self, node: WrappedTreeNode) -> WrappedTreeNode {
+        let nw = node.nw.clone();
+        let ne = node.ne.clone();
+        let sw = node.sw.clone();
+        let se = node.se.clone();
+        let bitmask =
+            nw.nw.population << 15 | nw.ne.population << 14 | ne.nw.population << 13 | ne.ne.population << 12 |
+            nw.sw.population << 11 | nw.se.population << 10 | ne.sw.population <<  9 | ne.se.population <<  8 |
+            sw.nw.population <<  7 | sw.ne.population <<  6 | se.nw.population <<  5 | se.ne.population <<  4 |
+            sw.sw.population <<  3 | sw.se.population <<  2 | se.sw.population <<  1 | se.se.population;
+
+        self.level1_create(
+            self.eval_mask(bitmask >> 5) | 
+            self.eval_mask(bitmask >> 4) << 1 | 
+            self.eval_mask(bitmask >> 1) << 2 |
+            self.eval_mask(bitmask) << 3
+        )
+    }
+
+    fn node_quick_next_generation(&mut self, node: WrappedTreeNode) -> WrappedTreeNode {
+        if let Some(cached) = node.get_quick_cache() {
+            assert_eq!(cached.level, node.level-1);
+            return cached;
+        }
+
+        if node.level == 2 {
+            let new_node = self.node_level2_next(node.clone());
+            node.quick_cache.set(Some(new_node.clone()));
+            return new_node;
+        }
+
+        let nw = node.nw.clone();
+        let ne = node.ne.clone();
+        let sw = node.sw.clone();
+        let se = node.se.clone();
+        let n00 = self.node_quick_next_generation(nw.clone());
+        let n01_tree = self.create_tree(nw.ne.clone(), ne.nw.clone(), nw.se.clone(), ne.sw.clone());
+        let n01 = self.node_quick_next_generation(n01_tree);
+        let n02 = self.node_quick_next_generation(ne.clone());
+        let n10_tree = self.create_tree(nw.sw.clone(), nw.se.clone(), sw.nw.clone(), sw.ne.clone());
+        let n10 = self.node_quick_next_generation(n10_tree);
+        let n11_tree = self.create_tree(nw.se.clone(), ne.sw.clone(), sw.ne.clone(), se.nw.clone());
+        let n11 = self.node_quick_next_generation(n11_tree);
+        let n12_tree = self.create_tree(ne.sw.clone(), ne.se.clone(), se.nw.clone(), se.ne.clone());
+        let n12 = self.node_quick_next_generation(n12_tree);
+        let n20 = self.node_quick_next_generation(sw.clone());
+        let n21_tree = self.create_tree(sw.ne.clone(), se.nw.clone(), sw.se.clone(), se.sw.clone());
+        let n21 = self.node_quick_next_generation(n21_tree);
+        let n22 = self.node_quick_next_generation(se.clone());
+
+        let n00_n01_n10_n11 = self.create_tree(n00, n01.clone(), n10.clone(), n11.clone());
+        let n01_n02_n11_n12 = self.create_tree(n01, n02, n11.clone(), n12.clone());
+        let n10_n11_n20_n21 = self.create_tree(n10, n11.clone(), n20, n21.clone());
+        let n11_n12_n21_n22 = self.create_tree(n11, n12, n21, n22);
+
+        let nw_tree = self.node_quick_next_generation(n00_n01_n10_n11);
+        let ne_tree = self.node_quick_next_generation(n01_n02_n11_n12);
+        let sw_tree = self.node_quick_next_generation(n10_n11_n20_n21);
+        let se_tree = self.node_quick_next_generation(n11_n12_n21_n22);
+
+
+        let new_node = self.create_tree(
+            nw_tree,
+            ne_tree,
+            sw_tree,
+            se_tree
+        );
+
+        assert_eq!(new_node.level, node.level-1);
+        node.quick_cache.set(Some(new_node.clone()));
+        new_node
+    }
+
+    fn node_next_generation(&mut self, node: WrappedTreeNode) -> WrappedTreeNode {
+        if let Some(cached) = node.get_cache() {
+            return cached;
+        }
+
+        if self.step == node.level - 2 {
+            return self.node_quick_next_generation(node);
+        }
+
+        if node.level == 2 {
+            if let Some(cached) = node.get_quick_cache() {
+                return cached;
+            } else {
+                let new_node = self.node_level2_next(node.clone());
+                node.quick_cache.set(Some(new_node.clone()));
+                return new_node;
+            }
+        }
+
+        let nw = node.nw.clone();
+        let ne = node.ne.clone();
+        let sw = node.sw.clone();
+        let se = node.se.clone();
+        let n00 = self.create_tree(nw.nw.se.clone(), nw.ne.sw.clone(), nw.sw.ne.clone(), nw.se.nw.clone());
+        let n01 = self.create_tree(nw.ne.se.clone(), ne.nw.sw.clone(), nw.se.ne.clone(), ne.sw.nw.clone());
+        let n02 = self.create_tree(ne.nw.se.clone(), ne.ne.sw.clone(), ne.sw.ne.clone(), ne.se.nw.clone());
+        let n10 = self.create_tree(nw.sw.se.clone(), nw.se.sw.clone(), sw.nw.ne.clone(), sw.ne.nw.clone());
+        let n11 = self.create_tree(nw.se.se.clone(), ne.sw.sw.clone(), sw.ne.ne.clone(), se.nw.nw.clone());
+        let n12 = self.create_tree(ne.sw.se.clone(), ne.se.sw.clone(), se.nw.ne.clone(), se.ne.nw.clone());
+        let n20 = self.create_tree(sw.nw.se.clone(), sw.ne.sw.clone(), sw.sw.ne.clone(), sw.se.nw.clone());
+        let n21 = self.create_tree(sw.ne.se.clone(), se.nw.sw.clone(), sw.se.ne.clone(), se.sw.nw.clone());
+        let n22 = self.create_tree(se.nw.se.clone(), se.ne.sw.clone(), se.sw.ne.clone(), se.se.nw.clone());
+
+        //debug_assert!(n00.level == n01.level && n00.level == n02.level && n00.level == n10.level && n00.level == n11.level && n00.level == n12.level && n00.level == n20.level && n00.level == n21.level && n00.level == n22.level);
+
+        let n00_n01_n10_n11 = self.create_tree(n00, n01.clone(), n10.clone(), n11.clone());
+        let n01_n02_n11_n12 = self.create_tree(n01, n02, n11.clone(), n12.clone());
+        let n10_n11_n20_n21 = self.create_tree(n10, n11.clone(), n20, n21.clone());
+        let n11_n12_n21_n22 = self.create_tree(n11, n12, n21, n22);
+
+        let nw_tree = self.node_next_generation(n00_n01_n10_n11);
+        let ne_tree = self.node_next_generation(n01_n02_n11_n12);
+        let sw_tree = self.node_next_generation(n10_n11_n20_n21);
+        let se_tree = self.node_next_generation(n11_n12_n21_n22);
+
+        let new_node = self.create_tree(
+            nw_tree,
+            ne_tree,
+            sw_tree,
+            se_tree
+        );
+
+        node.cache.set(Some(new_node.clone()));
+        new_node
+    }
+
+    #[allow(dead_code)]
+    pub fn next_generation(&mut self, is_single: bool) {
+        let mut root = self.root.clone();
+
+        while (is_single && root.level <= self.step + 2) ||
+                root.nw.population != root.nw.se.se.population ||
+                root.ne.population != root.ne.sw.sw.population ||
+                root.sw.population != root.sw.ne.ne.population ||
+                root.se.population != root.se.nw.nw.population {
+            root = self.expand_universe(root);
+        }
+
+        if is_single {
+            self.generation += self.pow2(self.step);
+            root = self.node_next_generation(root);
+        } else {
+            self.generation += self.pow2(self.root.level - 2);
+            root = self.node_quick_next_generation(root);
+        }
+
+        self.root = root;
+    }
+
+    fn get_bounds(&self, field_x: &Vec<i32>, field_y: &Vec<i32>) -> Bounds {
+        if field_x.is_empty() {
+            return Bounds {
+                left: 0,
+                right: 0,
+                top: 0,
+                bottom: 0
+            };
+        }
+
+        let mut bounds= Bounds {
+            left: field_x[0],
+            right: field_x[0],
+            top: field_y[0],
+            bottom: field_y[0]
+        };
+
+        for i in 1..field_x.len() {
+            if field_x[i] < bounds.left {
+                bounds.left = field_x[i];
+            } else if field_x[i] > bounds.right {
+                bounds.right = field_x[i];
+            }
+
+            if field_y[i] < bounds.top {
+                bounds.top = field_y[i];
+            } else if field_y[i] > bounds.bottom {
+                bounds.bottom = field_y[i];
+            }
+        }
+
+        bounds
+    }
+
+    fn move_field(&mut self, field_x: &mut Vec<i32>, field_y: &mut Vec<i32>, offset_x: i32, offset_y: i32) {
+        for i in 0..field_x.len() {
+            field_x[i] += offset_x;
+            field_y[i] += offset_y;
+        }
+    }
+
+    fn partition(&self, start: usize, end: usize, test_field: &mut Vec<i32>, other_field: &mut Vec<i32>, offset: i32) -> usize {
+        let mut i = start;
+        let mut j = end;
+
+        while j != usize::MAX && i <= j {
+            while i <= end && (test_field[i] & offset == 0) {
+                i += 1;
+            }
+
+            while j > start && (test_field[j] & offset != 0) {
+                // no need to check for out of bounds since min start is 0 and j > start
+                j -= 1;
+            }
+
+            if i >= j {
+                break;
+            }
+
+            test_field.swap(i, j);
+            other_field.swap(i, j);
+
+            i += 1;
+            j = j.overflowing_sub(1).0;
+        }
+
+        i
+    }
+
+    fn level2_setup(&mut self, start: usize, end: usize, field_x: &mut Vec<i32>, field_y: &mut Vec<i32>) -> WrappedTreeNode {
+        let mut set = 0;
+        // log("Start level2_setup");
+        for i in start..=end {
+            let x = field_x[i];
+            let y = field_y[i];
+
+            // log(format!("x: {}, y: {}", x, y).as_str());
+            set |= 1 << ( x & 1 | (y & 1 | x & 2) << 1 | (y & 2) << 2);
+        }
+
+        if let Some(cached) = &self.level2_cache[set] {
+            cached.clone()
+        } else {
+            let nw = self.level1_create(set);
+            let ne = self.level1_create(set >> 4);
+            let sw = self.level1_create(set >> 8);
+            let se = self.level1_create(set >> 12);
+
+            let new_node = self.create_tree(nw, ne, sw, se);
+
+            self.level2_cache[set].insert(new_node).clone()
+        }
+    }
+    
+    fn setup_field_recurse(&mut self, start: usize, end: usize, field_x: &mut Vec<i32>, field_y: &mut Vec<i32>, mut level: usize) -> WrappedTreeNode {
+        // log(format!("From recurse: current level is: {}", level).as_str());
+        if start > end || end == usize::MAX /* wrapped around */ {
+            return self.empty_tree(level);
+        }
+
+        if level == 2 {
+            return self.level2_setup(start, end, field_x, field_y);
+        }
+
+        level -= 1;
+
+        // log("From recurse: partitioning...");
+
+        let offset = 1 << level;
+        let part3 = self.partition(start, end, field_y, field_x, offset);
+        let part2 = self.partition(start, part3.overflowing_sub(1).0, field_x, field_y, offset);
+        let part4 = self.partition(part3, end, field_x, field_y, offset);
+
+        // log("From recurse: recursing...");
+
+        let nw = self.setup_field_recurse(start, part2.overflowing_sub(1).0, field_x, field_y, level);
+        let ne = self.setup_field_recurse(part2, part3.overflowing_sub(1).0, field_x, field_y, level);
+        let sw = self.setup_field_recurse(part3, part4.overflowing_sub(1).0, field_x, field_y, level);
+        let se = self.setup_field_recurse(part4, end, field_x, field_y, level);
+
+        // log("From recurse: creating tree...");
+
+        self.create_tree(nw, ne, sw, se)
+    }
+
+    #[allow(dead_code)]
+    pub fn setup_field(&mut self, mut field_x: Vec<i32>, mut field_y: Vec<i32>) {
+        debug_assert_eq!(field_x.len(), field_y.len());
+        let mut bounds = self.get_bounds(&field_x, &field_y);
+        let offset_x = ((bounds.left - bounds.right + 1) / 2) - bounds.left;
+        let offset_y = ((bounds.top - bounds.bottom + 1) / 2) - bounds.top;
+
+        self.move_field(&mut field_x, &mut field_y, offset_x as i32, offset_y as i32);
+
+        bounds.left += offset_x;
+        bounds.right += offset_x;
+        bounds.top += offset_y;
+        bounds.bottom += offset_y;
+
+        let level = self.get_level_from_bounds(vec![bounds.left as f64, bounds.right as f64, bounds.top as f64, bounds.bottom as f64]).max(4);
+        let offset = 1 << (level - 1) as i32;
+        let count = field_x.len();
+
+        self.move_field(&mut field_x, &mut field_y, offset, offset);
+
+        self.root = self.setup_field_recurse(0, count-1, &mut field_x, &mut field_y, level);
+    }
+
+    #[allow(dead_code)]
+    pub fn get_step(&self) -> usize {
+        self.step
+    }
+
+    #[allow(dead_code)]
+    pub fn set_step(&mut self, step: usize) {
+        if step != self.step {
+            self.step = step;
+
+            self.uncache(false);
+            self.reset_caches();
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn set_rules(&mut self, s: usize, b: usize) {
+        if self.rule_s != s || self.rule_b != b {
+            self.rule_s = s;
+            self.rule_b = b;
+
+            self.uncache(true);
+            self.reset_caches();
+        }
+    }
+
+    fn draw_node(node: WrappedTreeNode, data: &mut Vec<f64>, x: f64, y: f64, size: f64, offset_x: f64, offset_y: f64, height: f64, width: f64) {
+        // log(format!("Drawing node... Population: {}, Level: {}", node.population, node.level).as_str());
+        if node.population == 0 {
+            return;
+        }
+
+        if x + size + offset_x < 0.0 || y + size + offset_y < 0.0 {//|| x + offset_x >= width || y + offset_y >= height {
+            // don't draw outside of screen
+            return;
+        }
+
+        if size <= 1.0 || node.level == 0 {
+            // no need to check if population is 0, because we already did that earlier
+            data.push(x + offset_x);
+            data.push(y + offset_y);
+        } else {
+            let size = size / 2.0;
+
+            Self::draw_node(node.nw.clone(), data, x, y, size, offset_x, offset_y, height, width);
+            Self::draw_node(node.ne.clone(), data, x + size, y, size, offset_x, offset_y, height, width);
+            Self::draw_node(node.sw.clone(), data, x, y + size, size, offset_x, offset_y, height, width);
+            Self::draw_node(node.se.clone(), data, x + size, y + size, size, offset_x, offset_y, height, width);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn draw(&self, x: f64, y: f64, size: f64, height: f64, width: f64, offset_x: f64, offset_y: f64) -> Vec<f64> {
+        let mut data = Vec::new();
+        // log(format!("Starting draw with: x: {}, y: {}, size: {}, offset_x: {}, offset_y: {}, height: {}, width: {}", x, y, size, offset_x, offset_y, height, width).as_str());
+        Self::draw_node(self.root.clone(), &mut data, x, y, size, offset_x, offset_y, height, width);
+        data
+    }
+
+    #[allow(dead_code)]
+    pub fn get_generation(&self) -> f64 {
+        self.generation
+    }
+
+    #[allow(dead_code)]
+    pub fn get_population(&self) -> usize {
+        self.root.population
+    }
+
+    #[allow(dead_code)]
+    pub fn get_level(&self) -> usize {
+        self.root.level
+    }
+}

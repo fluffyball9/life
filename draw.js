@@ -104,45 +104,11 @@ function LifeCanvasDrawer()
         }
     }
 
-    function draw_node(node, size, left, top)
+    function draw_node(life, size, left, top)
     {
-        if(node.population === 0)
-        {
-            return;
-        }
-
-        if(
-            left + size + canvas_offset_x < 0 ||
-            top + size + canvas_offset_y < 0 ||
-            left + canvas_offset_x >= canvas_width ||
-            top + canvas_offset_y >= canvas_height
-        ) {
-            // do not draw outside of the screen
-            return;
-        }
-
-        if(size <= 1)
-        {
-            if(node.population)
-            {
-                fill_square(left + canvas_offset_x | 0, top + canvas_offset_y | 0, 1);
-            }
-        }
-        else if(node.level === 0)
-        {
-            if(node.population)
-            {
-                fill_square(left + canvas_offset_x, top + canvas_offset_y, drawer.cell_width);
-            }
-        }
-        else
-        {
-            size /= 2;
-
-            draw_node(node.nw, size, left, top);
-            draw_node(node.ne, size, left + size, top);
-            draw_node(node.sw, size, left, top + size);
-            draw_node(node.se, size, left + size, top + size);
+        var data = life.draw(left, top, size, canvas_height, canvas_width, canvas_offset_x, canvas_offset_y);
+        for(let i = 0; i < data.length; i += 2) {
+            fill_square(data[i], data[i + 1], Math.max(drawer.cell_width, 1));
         }
     }
 
@@ -150,6 +116,8 @@ function LifeCanvasDrawer()
     {
         var width = size - border_width,
             height = width;
+        x |= 0;
+        y |= 0;
 
         if(x < 0)
         {
@@ -197,7 +165,7 @@ function LifeCanvasDrawer()
     }
 
 
-    function redraw(node)
+    function redraw(life)
     {
         var bg_color_rgb = color2rgb(drawer.background_color);
         var bg_color_int = bg_color_rgb.r | bg_color_rgb.g << 8 | bg_color_rgb.b << 16 | 0xFF << 24;
@@ -212,9 +180,9 @@ function LifeCanvasDrawer()
             image_data_data[i] = bg_color_int;
         }
 
-        var size = Math.pow(2, node.level - 1) * drawer.cell_width;
+        var size = Math.pow(2, life.get_level() - 1) * drawer.cell_width;
 
-        draw_node(node, 2 * size, -size, -size);
+        draw_node(life, 2 * size, -size, -size);
 
         context.putImageData(image_data, 0, 0);
     }
