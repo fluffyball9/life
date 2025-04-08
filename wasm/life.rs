@@ -1,12 +1,11 @@
 use std::cell::Cell;
-use std::hash::{DefaultHasher, Hasher};
+use std::collections::HashMap;
 use std::mem::{self, MaybeUninit};
 use std::rc::Rc;
 use wasm_bindgen::prelude::wasm_bindgen;
 
-const LOAD_FACTOR: f64 = 0.7;
-const INITIAL_SIZE: usize = 10;
-const HASHMAP_LIMIT: usize = 24;
+const INITIAL_SIZE: usize = 15;
+const HASHMAP_LIMIT: usize = 22;
 const MASK_LEFT: usize = 1;
 const MASK_TOP: usize = 2;
 const MASK_RIGHT: usize = 4;
@@ -48,18 +47,13 @@ struct TreeNode {
     quick_cache: Cell<Option<Rc<TreeNode>>>,
 }
 
-#[derive(Clone)]
-#[repr(C)]
-struct HashMapNode {
-    node: Rc<TreeNode>,
-    next: Option<Box<HashMapNode>>,
-}
-
 impl PartialEq for TreeNode {
     fn eq(&self, other: &Self) -> bool {
         core::ptr::eq(self, other)
     }
 }
+
+impl Eq for TreeNode {}
 
 impl TreeNode {
     pub fn new(
@@ -119,14 +113,16 @@ impl TreeNode {
 
     pub fn get_cache(&self) -> Option<Rc<TreeNode>> {
         let cached = self.cache.take();
-        self.cache.set(cached.clone());
-        cached
+        let ret = cached.clone();
+        self.cache.set(cached);
+        ret
     }
 
     pub fn get_quick_cache(&self) -> Option<Rc<TreeNode>> {
         let cached = self.quick_cache.take();
-        self.quick_cache.set(cached.clone());
-        cached
+        let ret = cached.clone();
+        self.quick_cache.set(cached);
+        ret
     }
 }
 
@@ -139,10 +135,8 @@ struct Bounds {
 
 #[wasm_bindgen]
 struct LifeUniverse {
-    node_count: usize,
     hashmap_size: usize,
-    max_load: usize,
-    hashmap: Vec<Option<Box<HashMapNode>>>,
+    hashmap: HashMap<[usize; 4], Rc<TreeNode>>,
     empty_tree_cache: Vec<Option<Rc<TreeNode>>>,
     level2_cache: Vec<Option<Rc<TreeNode>>>,
     rule_b: usize,
@@ -158,28 +152,20 @@ struct LifeUniverse {
 
 #[wasm_bindgen]
 impl LifeUniverse {
-    fn in_hashmap(&self, n: Rc<TreeNode>) -> bool {
-        let hash = Self::calc_hash(
-            Rc::as_ptr(&n.nw) as usize,
-            Rc::as_ptr(&n.ne) as usize,
-            Rc::as_ptr(&n.sw) as usize,
-            Rc::as_ptr(&n.se) as usize,
-        ) & self.hashmap_size;
-        let mut node = &self.hashmap[hash];
+    fn get_key2(nw: &Rc<TreeNode>, ne: &Rc<TreeNode>, sw: &Rc<TreeNode>, se: &Rc<TreeNode>) -> [usize; 4] {
+        [Rc::as_ptr(nw) as usize, Rc::as_ptr(ne) as usize, Rc::as_ptr(sw) as usize, Rc::as_ptr(se) as usize]
+    }
 
-        while let Some(x) = node {
-            if n == x.node {
-                return true;
-            }
-            node = &x.next;
-        }
-        false
+    fn get_key(n: &Rc<TreeNode>) -> [usize; 4] {
+        Self::get_key2(&n.nw, &n.ne, &n.sw, &n.se)
+    }
+
+    fn in_hashmap(&self, n: Rc<TreeNode>) -> bool {
+        self.hashmap.contains_key(&Self::get_key(&n))
     }
 
     fn node_hash(&mut self, node: Rc<TreeNode>) {
         if !self.in_hashmap(node.clone()) {
-            self.node_count += 1;
-
             if node.level > 1 {
                 self.node_hash(node.nw.clone());
                 self.node_hash(node.ne.clone());
@@ -195,7 +181,7 @@ impl LifeUniverse {
                 }
             }
 
-            self.hashmap_insert(node.clone());
+            self.hashmap_insert(node);
         }
     }
 
@@ -206,36 +192,20 @@ impl LifeUniverse {
 
     fn garbage_collect(&mut self) {
         // log(format!("Garbage collecting..., current hs_size: {}, last_id: {}", self.hashmap_size, self.last_id).as_str());
-        time("GC: reset hashmap");
+        // time("GC: reset hashmap");
 
+        self.hashmap.clear();
         if self.hashmap_size < (1 << HASHMAP_LIMIT) - 1 {
             self.hashmap_size = self.hashmap_size << 1 | 1;
         }
-        self.hashmap = vec![None; self.hashmap_size + 1];
-        timeEnd("GC: reset hashmap");
+        self.hashmap.reserve(self.hashmap_size.saturating_sub(self.hashmap.capacity()));
+        // timeEnd("GC: reset hashmap");
 
-        self.max_load = (self.hashmap_size as f64 * LOAD_FACTOR) as usize;
-        self.node_count = 0;
-        time("GC: rehashing nodes");
+        // time("GC: rehashing nodes");
         self.node_hash(self.root.clone());
-        timeEnd("GC: rehashing nodes");
+        // timeEnd("GC: rehashing nodes");
 
         // log(format!("Garbage collection done..., new hs_size: {}, last_id: {}", self.hashmap_size, self.last_id).as_str());
-    }
-
-    fn calc_hash(nw: usize, ne: usize, sw: usize, se: usize) -> usize {
-        //((nw.wrapping_mul(23).0 ^ ne).wrapping_mul(23) ^ sw).wrapping_mul(23) ^ se
-        /*let r = nw.wrapping_mul(65537)
-            .wrapping_add(ne.wrapping_mul(257))
-            .wrapping_add(sw.wrapping_mul(17))
-            .wrapping_add(se.wrapping_mul(5));
-        r.wrapping_add(r >> 11) */
-        let mut hash = DefaultHasher::new();
-        hash.write_usize(nw);
-        hash.write_usize(ne);
-        hash.write_usize(sw);
-        hash.write_usize(se);
-        hash.finish() as usize
     }
 
     fn create_tree(
@@ -248,40 +218,15 @@ impl LifeUniverse {
         debug_assert_eq!(nw.level, ne.level);
         debug_assert_eq!(nw.level, sw.level);
         debug_assert_eq!(nw.level, se.level);
-        let hash = Self::calc_hash(
-            Rc::as_ptr(&nw) as usize,
-            Rc::as_ptr(&ne) as usize,
-            Rc::as_ptr(&sw) as usize,
-            Rc::as_ptr(&se) as usize,
-        ) & self.hashmap_size;
-        // log(format!("Creating tree... Hash: {}", hash).as_str());
-        let mut node = &mut self.hashmap[hash];
 
-        //let mut collision_count = 0;
-        while let Some(n) = node {
-            if n.node.nw == nw && n.node.ne == ne && n.node.sw == sw && n.node.se == se {
-                // log("Create Tree: Tree already exists...");
-                return n.node.clone();
-            }
-            //collision_count += 1;
-            node = &mut n.next;
-        }
-        /*unsafe {
-            COLLISION_COUNT = COLLISION_COUNT.max(collision_count);
-        }*/
-
-        if self.node_count > self.max_load {
+        if self.hashmap.len() == self.hashmap_size {
             self.garbage_collect();
             return self.create_tree(nw, ne, sw, se);
         }
 
-        let new_node = HashMapNode {
-            node: TreeNode::new(nw, ne, sw, se),
-            next: None,
-        };
-        self.node_count += 1;
-
-        node.insert(Box::new(new_node)).node.clone()
+        self.hashmap.entry(Self::get_key2(&nw, &ne, &sw, &se)).or_insert_with(|| {
+            TreeNode::new(nw, ne, sw, se)
+        }).clone()
     }
 
     fn empty_tree(&mut self, level: usize) -> Rc<TreeNode> {
@@ -309,10 +254,8 @@ impl LifeUniverse {
 
     #[allow(dead_code)]
     pub fn clear_pattern(&mut self) {
-        self.node_count = 0;
         self.hashmap_size = (1 << INITIAL_SIZE) - 1;
-        self.max_load = (self.hashmap_size as f64 * LOAD_FACTOR) as usize;
-        self.hashmap = vec![None; self.hashmap_size + 1];
+        self.hashmap = HashMap::with_capacity(self.hashmap_size);
         self.empty_tree_cache.fill(None);
         self.level2_cache = vec![None; 0x10000];
         self.root = self.empty_tree(3);
@@ -333,10 +276,8 @@ impl LifeUniverse {
         let false_leaf = TreeNode::new_leaf(0);
         let true_leaf = TreeNode::new_leaf(1);
         let mut ret = LifeUniverse {
-            node_count: 0,
             hashmap_size: 0,
-            max_load: 0,
-            hashmap: vec![],
+            hashmap: HashMap::new(),
             empty_tree_cache: vec![],
             level2_cache: vec![],
             root: true_leaf.clone(),
@@ -639,34 +580,16 @@ impl LifeUniverse {
     }
 
     fn uncache(&mut self, also_quick: bool) {
-        for node in &mut self.hashmap {
-            if let Some(n) = node {
-                n.node.cache.take();
-                n.next.take();
-                if also_quick {
-                    n.node.quick_cache.take();
-                }
+        for (_, n) in &mut self.hashmap {
+            n.cache.take();
+            if also_quick {
+                n.quick_cache.take();
             }
         }
     }
 
     fn hashmap_insert(&mut self, n: Rc<TreeNode>) {
-        let hash = Self::calc_hash(
-            Rc::as_ptr(&n.nw) as usize,
-            Rc::as_ptr(&n.ne) as usize,
-            Rc::as_ptr(&n.sw) as usize,
-            Rc::as_ptr(&n.se) as usize,
-        ) & self.hashmap_size;
-        let mut node = &mut self.hashmap[hash];
-
-        while let Some(n) = node {
-            node = &mut n.next;
-        }
-
-        let _ = node.insert(Box::new(HashMapNode {
-            node: n,
-            next: None,
-        }));
+        self.hashmap.insert(Self::get_key(&n), n);
     }
 
     fn node_level2_next(&mut self, node: Rc<TreeNode>) -> Rc<TreeNode> {
@@ -1082,6 +1005,16 @@ impl LifeUniverse {
             self.uncache(true);
             self.reset_caches();
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn get_rule_s(&self) -> usize {
+        self.rule_s
+    }
+
+    #[allow(dead_code)]
+    pub fn get_rule_b(&self) -> usize {
+        self.rule_b
     }
 
     fn draw_node(

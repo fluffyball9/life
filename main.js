@@ -956,7 +956,7 @@ var
             {
                 show_overlay("settings_dialog");
 
-                $("rule").value = formats.rule2str(life.rule_s, life.rule_b);
+                $("rule").value = formats.rule2str(life.get_rule_s(), life.get_rule_b());
                 $("max_fps").value = max_fps;
                 $("gen_step").value = Math.pow(2, life.get_step());
 
