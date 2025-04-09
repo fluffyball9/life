@@ -1,3 +1,4 @@
+use ahash::RandomState;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::mem::{self, MaybeUninit};
@@ -136,7 +137,7 @@ struct Bounds {
 #[wasm_bindgen]
 struct LifeUniverse {
     hashmap_size: usize,
-    hashmap: HashMap<[usize; 4], Rc<TreeNode>>,
+    hashmap: HashMap<[usize; 4], Rc<TreeNode>, RandomState>,
     empty_tree_cache: Vec<Option<Rc<TreeNode>>>,
     level2_cache: Vec<Option<Rc<TreeNode>>>,
     rule_b: usize,
@@ -255,7 +256,7 @@ impl LifeUniverse {
     #[allow(dead_code)]
     pub fn clear_pattern(&mut self) {
         self.hashmap_size = (1 << INITIAL_SIZE) - 1;
-        self.hashmap = HashMap::with_capacity(self.hashmap_size);
+        self.hashmap = HashMap::with_capacity_and_hasher(self.hashmap_size, RandomState::default());
         self.empty_tree_cache.fill(None);
         self.level2_cache = vec![None; 0x10000];
         self.root = self.empty_tree(3);
@@ -277,7 +278,7 @@ impl LifeUniverse {
         let true_leaf = TreeNode::new_leaf(1);
         let mut ret = LifeUniverse {
             hashmap_size: 0,
-            hashmap: HashMap::new(),
+            hashmap: HashMap::default(),
             empty_tree_cache: vec![],
             level2_cache: vec![],
             root: true_leaf.clone(),

@@ -5,6 +5,7 @@ edition = "2018"
 
 [dependencies]
 wasm-bindgen = "0.2"
+ahash = { version = "0.8", default-features = false, features = ["compile-time-rng"] }
 
 [lib]
 crate-type = ["cdylib"]
