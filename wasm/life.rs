@@ -1,8 +1,8 @@
-use ahash::RandomState;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::mem::{self, MaybeUninit};
 use std::rc::Rc;
+use rustc_hash::FxBuildHasher;
 use wasm_bindgen::prelude::wasm_bindgen;
 
 const INITIAL_SIZE: usize = 15;
@@ -137,7 +137,7 @@ struct Bounds {
 #[wasm_bindgen]
 struct LifeUniverse {
     hashmap_size: usize,
-    hashmap: HashMap<[usize; 4], Rc<TreeNode>, RandomState>,
+    hashmap: HashMap<[usize; 4], Rc<TreeNode>, FxBuildHasher>,
     empty_tree_cache: Vec<Option<Rc<TreeNode>>>,
     level2_cache: Vec<Option<Rc<TreeNode>>>,
     rule_b: usize,
@@ -153,8 +153,18 @@ struct LifeUniverse {
 
 #[wasm_bindgen]
 impl LifeUniverse {
-    fn get_key2(nw: &Rc<TreeNode>, ne: &Rc<TreeNode>, sw: &Rc<TreeNode>, se: &Rc<TreeNode>) -> [usize; 4] {
-        [Rc::as_ptr(nw) as usize, Rc::as_ptr(ne) as usize, Rc::as_ptr(sw) as usize, Rc::as_ptr(se) as usize]
+    fn get_key2(
+        nw: &Rc<TreeNode>,
+        ne: &Rc<TreeNode>,
+        sw: &Rc<TreeNode>,
+        se: &Rc<TreeNode>,
+    ) -> [usize; 4] {
+        [
+            Rc::as_ptr(nw) as usize,
+            Rc::as_ptr(ne) as usize,
+            Rc::as_ptr(sw) as usize,
+            Rc::as_ptr(se) as usize,
+        ]
     }
 
     fn get_key(n: &Rc<TreeNode>) -> [usize; 4] {
@@ -199,7 +209,8 @@ impl LifeUniverse {
         if self.hashmap_size < (1 << HASHMAP_LIMIT) - 1 {
             self.hashmap_size = self.hashmap_size << 1 | 1;
         }
-        self.hashmap.reserve(self.hashmap_size.saturating_sub(self.hashmap.capacity()));
+        self.hashmap
+            .reserve(self.hashmap_size.saturating_sub(self.hashmap.capacity()));
         // timeEnd("GC: reset hashmap");
 
         // time("GC: rehashing nodes");
@@ -225,9 +236,10 @@ impl LifeUniverse {
             return self.create_tree(nw, ne, sw, se);
         }
 
-        self.hashmap.entry(Self::get_key2(&nw, &ne, &sw, &se)).or_insert_with(|| {
-            TreeNode::new(nw, ne, sw, se)
-        }).clone()
+        self.hashmap
+            .entry(Self::get_key2(&nw, &ne, &sw, &se))
+            .or_insert_with(|| TreeNode::new(nw, ne, sw, se))
+            .clone()
     }
 
     fn empty_tree(&mut self, level: usize) -> Rc<TreeNode> {
@@ -256,7 +268,8 @@ impl LifeUniverse {
     #[allow(dead_code)]
     pub fn clear_pattern(&mut self) {
         self.hashmap_size = (1 << INITIAL_SIZE) - 1;
-        self.hashmap = HashMap::with_capacity_and_hasher(self.hashmap_size, RandomState::default());
+        self.hashmap =
+            HashMap::with_capacity_and_hasher(self.hashmap_size, Default::default());
         self.empty_tree_cache.fill(None);
         self.level2_cache = vec![None; 0x10000];
         self.root = self.empty_tree(3);
@@ -791,7 +804,7 @@ impl LifeUniverse {
             root = self.node_quick_next_generation(root);
         }
 
-        //log(format!("Collision count: {}", unsafe { COLLISION_COUNT }).as_str());
+        // log(format!("Collision count: {}", unsafe { COLLISION_COUNT }).as_str());
 
         self.root = root;
     }
@@ -939,12 +952,9 @@ impl LifeUniverse {
 
         // log("From recurse: recursing...");
 
-        let nw =
-            self.setup_field_recurse(start, part2.wrapping_sub(1), field_x, field_y, level);
-        let ne =
-            self.setup_field_recurse(part2, part3.wrapping_sub(1), field_x, field_y, level);
-        let sw =
-            self.setup_field_recurse(part3, part4.wrapping_sub(1), field_x, field_y, level);
+        let nw = self.setup_field_recurse(start, part2.wrapping_sub(1), field_x, field_y, level);
+        let ne = self.setup_field_recurse(part2, part3.wrapping_sub(1), field_x, field_y, level);
+        let sw = self.setup_field_recurse(part3, part4.wrapping_sub(1), field_x, field_y, level);
         let se = self.setup_field_recurse(part4, end, field_x, field_y, level);
 
         // log("From recurse: creating tree...");
@@ -1019,7 +1029,7 @@ impl LifeUniverse {
     }
 
     fn draw_node(
-        node: Rc<TreeNode>,
+        node: &Rc<TreeNode>,
         data: &mut Vec<f64>,
         x: f64,
         y: f64,
@@ -1030,12 +1040,12 @@ impl LifeUniverse {
         width: f64,
     ) {
         // log(format!("Drawing node... Population: {}, Level: {}", node.population, node.level).as_str());
-        if node.population == 0 {
-            return;
-        }
-
-        if x + size + offset_x < 0.0 || y + size + offset_y < 0.0 {
-            //|| x + offset_x >= width || y + offset_y >= height {
+        if node.population == 0
+            || x + size + offset_x < 0.0
+            || y + size + offset_y < 0.0
+            || x + offset_x >= width
+            || y + offset_y >= height
+        {
             // don't draw outside of screen
             return;
         }
@@ -1048,18 +1058,10 @@ impl LifeUniverse {
             let size = size / 2.0;
 
             Self::draw_node(
-                node.nw.clone(),
-                data,
-                x,
-                y,
-                size,
-                offset_x,
-                offset_y,
-                height,
-                width,
+                &node.nw, data, x, y, size, offset_x, offset_y, height, width,
             );
             Self::draw_node(
-                node.ne.clone(),
+                &node.ne,
                 data,
                 x + size,
                 y,
@@ -1070,7 +1072,7 @@ impl LifeUniverse {
                 width,
             );
             Self::draw_node(
-                node.sw.clone(),
+                &node.sw,
                 data,
                 x,
                 y + size,
@@ -1081,7 +1083,7 @@ impl LifeUniverse {
                 width,
             );
             Self::draw_node(
-                node.se.clone(),
+                &node.se,
                 data,
                 x + size,
                 y + size,
@@ -1108,15 +1110,7 @@ impl LifeUniverse {
         let mut data = Vec::new();
         // log(format!("Starting draw with: x: {}, y: {}, size: {}, offset_x: {}, offset_y: {}, height: {}, width: {}", x, y, size, offset_x, offset_y, height, width).as_str());
         Self::draw_node(
-            self.root.clone(),
-            &mut data,
-            x,
-            y,
-            size,
-            offset_x,
-            offset_y,
-            height,
-            width,
+            &self.root, &mut data, x, y, size, offset_x, offset_y, height, width,
         );
         data
     }

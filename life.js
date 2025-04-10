@@ -25,15 +25,6 @@ let wasm_bindgen;
         return cachedTextDecoder.decode(getUint8ArrayMemory0().subarray(ptr, ptr + len));
     }
 
-    let cachedDataViewMemory0 = null;
-
-    function getDataViewMemory0() {
-        if (cachedDataViewMemory0 === null || cachedDataViewMemory0.buffer.detached === true || (cachedDataViewMemory0.buffer.detached === undefined && cachedDataViewMemory0.buffer !== wasm.memory.buffer)) {
-            cachedDataViewMemory0 = new DataView(wasm.memory.buffer);
-        }
-        return cachedDataViewMemory0;
-    }
-
     let cachedFloat64ArrayMemory0 = null;
 
     function getFloat64ArrayMemory0() {
@@ -126,17 +117,10 @@ let wasm_bindgen;
          * @returns {Float64Array}
          */
         get_root_bounds() {
-            try {
-                const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-                wasm.lifeuniverse_get_root_bounds(retptr, this.__wbg_ptr);
-                var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
-                var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
-                var v1 = getArrayF64FromWasm0(r0, r1).slice();
-                wasm.__wbindgen_export_0(r0, r1 * 8, 8);
-                return v1;
-            } finally {
-                wasm.__wbindgen_add_to_stack_pointer(16);
-            }
+            const ret = wasm.lifeuniverse_get_root_bounds(this.__wbg_ptr);
+            var v1 = getArrayF64FromWasm0(ret[0], ret[1]).slice();
+            wasm.__wbindgen_free(ret[0], ret[1] * 8, 8);
+            return v1;
         }
         /**
          * @param {boolean} is_single
@@ -149,9 +133,9 @@ let wasm_bindgen;
          * @param {Int32Array} field_y
          */
         setup_field(field_x, field_y) {
-            const ptr0 = passArray32ToWasm0(field_x, wasm.__wbindgen_export_1);
+            const ptr0 = passArray32ToWasm0(field_x, wasm.__wbindgen_malloc);
             const len0 = WASM_VECTOR_LEN;
-            const ptr1 = passArray32ToWasm0(field_y, wasm.__wbindgen_export_1);
+            const ptr1 = passArray32ToWasm0(field_y, wasm.__wbindgen_malloc);
             const len1 = WASM_VECTOR_LEN;
             wasm.lifeuniverse_setup_field(this.__wbg_ptr, ptr0, len0, ptr1, len1);
         }
@@ -200,17 +184,10 @@ let wasm_bindgen;
          * @returns {Float64Array}
          */
         draw(x, y, size, height, width, offset_x, offset_y) {
-            try {
-                const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-                wasm.lifeuniverse_draw(retptr, this.__wbg_ptr, x, y, size, height, width, offset_x, offset_y);
-                var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
-                var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
-                var v1 = getArrayF64FromWasm0(r0, r1).slice();
-                wasm.__wbindgen_export_0(r0, r1 * 8, 8);
-                return v1;
-            } finally {
-                wasm.__wbindgen_add_to_stack_pointer(16);
-            }
+            const ret = wasm.lifeuniverse_draw(this.__wbg_ptr, x, y, size, height, width, offset_x, offset_y);
+            var v1 = getArrayF64FromWasm0(ret[0], ret[1]).slice();
+            wasm.__wbindgen_free(ret[0], ret[1] * 8, 8);
+            return v1;
         }
         /**
          * @returns {number}
@@ -270,6 +247,16 @@ let wasm_bindgen;
     function __wbg_get_imports() {
         const imports = {};
         imports.wbg = {};
+        imports.wbg.__wbindgen_init_externref_table = function() {
+            const table = wasm.__wbindgen_export_0;
+            const offset = table.grow(4);
+            table.set(0, undefined);
+            table.set(offset + 0, undefined);
+            table.set(offset + 1, null);
+            table.set(offset + 2, true);
+            table.set(offset + 3, false);
+            ;
+        };
         imports.wbg.__wbindgen_throw = function(arg0, arg1) {
             throw new Error(getStringFromWasm0(arg0, arg1));
         };
@@ -284,13 +271,12 @@ let wasm_bindgen;
     function __wbg_finalize_init(instance, module) {
         wasm = instance.exports;
         __wbg_init.__wbindgen_wasm_module = module;
-        cachedDataViewMemory0 = null;
         cachedFloat64ArrayMemory0 = null;
         cachedUint32ArrayMemory0 = null;
         cachedUint8ArrayMemory0 = null;
 
 
-
+        wasm.__wbindgen_start();
         return wasm;
     }
 
