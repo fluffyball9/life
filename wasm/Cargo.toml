@@ -13,4 +13,6 @@ path = "life.rs"
 
 [profile.release]
 lto = true
-strip = true
+
+[package.metadata.wasm-pack.profile.profiling]
+wasm-opt = false

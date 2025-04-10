@@ -1,8 +1,8 @@
+use rustc_hash::FxBuildHasher;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::mem::{self, MaybeUninit};
 use std::rc::Rc;
-use rustc_hash::FxBuildHasher;
 use wasm_bindgen::prelude::wasm_bindgen;
 
 const INITIAL_SIZE: usize = 15;
@@ -171,12 +171,12 @@ impl LifeUniverse {
         Self::get_key2(&n.nw, &n.ne, &n.sw, &n.se)
     }
 
-    fn in_hashmap(&self, n: Rc<TreeNode>) -> bool {
-        self.hashmap.contains_key(&Self::get_key(&n))
+    fn in_hashmap(&self, n: &Rc<TreeNode>) -> bool {
+        self.hashmap.contains_key(&Self::get_key(n))
     }
 
     fn node_hash(&mut self, node: Rc<TreeNode>) {
-        if !self.in_hashmap(node.clone()) {
+        if !self.in_hashmap(&node) {
             if node.level > 1 {
                 self.node_hash(node.nw.clone());
                 self.node_hash(node.ne.clone());
@@ -268,8 +268,7 @@ impl LifeUniverse {
     #[allow(dead_code)]
     pub fn clear_pattern(&mut self) {
         self.hashmap_size = (1 << INITIAL_SIZE) - 1;
-        self.hashmap =
-            HashMap::with_capacity_and_hasher(self.hashmap_size, Default::default());
+        self.hashmap = HashMap::with_capacity_and_hasher(self.hashmap_size, Default::default());
         self.empty_tree_cache.fill(None);
         self.level2_cache = vec![None; 0x10000];
         self.root = self.empty_tree(3);
@@ -422,7 +421,7 @@ impl LifeUniverse {
         self.create_tree(nw, ne, sw, se)
     }
 
-    fn node_get_bit(&self, node: Rc<TreeNode>, x: f64, y: f64) -> bool {
+    fn node_get_bit(&self, node: &Rc<TreeNode>, x: f64, y: f64) -> bool {
         if node.population == 0 {
             return false;
         }
@@ -439,15 +438,15 @@ impl LifeUniverse {
 
         if x < 0.0 {
             if y < 0.0 {
-                self.node_get_bit(node.nw.clone(), x + offset, y + offset)
+                self.node_get_bit(&node.nw, x + offset, y + offset)
             } else {
-                self.node_get_bit(node.sw.clone(), x + offset, y - offset)
+                self.node_get_bit(&node.sw, x + offset, y - offset)
             }
         } else {
             if y < 0.0 {
-                self.node_get_bit(node.ne.clone(), x - offset, y + offset)
+                self.node_get_bit(&node.ne, x - offset, y + offset)
             } else {
-                self.node_get_bit(node.se.clone(), x - offset, y - offset)
+                self.node_get_bit(&node.se, x - offset, y - offset)
             }
         }
     }
@@ -477,12 +476,12 @@ impl LifeUniverse {
             return false;
         }
 
-        self.node_get_bit(self.root.clone(), x, y)
+        self.node_get_bit(&self.root, x, y)
     }
 
     fn node_get_boundary(
         &self,
-        node: Rc<TreeNode>,
+        node: &Rc<TreeNode>,
         left: f64,
         top: f64,
         find_mask: usize,
@@ -544,16 +543,10 @@ impl LifeUniverse {
                 find_nw &= !MASK_BOTTOM & !MASK_RIGHT;
             }
 
-            self.node_get_boundary(node.nw.clone(), left, top, find_nw, boundary);
-            self.node_get_boundary(node.sw.clone(), left, top + offset, find_sw, boundary);
-            self.node_get_boundary(node.ne.clone(), left + offset, top, find_ne, boundary);
-            self.node_get_boundary(
-                node.se.clone(),
-                left + offset,
-                top + offset,
-                find_se,
-                boundary,
-            );
+            self.node_get_boundary(&node.nw, left, top, find_nw, boundary);
+            self.node_get_boundary(&node.sw, left, top + offset, find_sw, boundary);
+            self.node_get_boundary(&node.ne, left + offset, top, find_ne, boundary);
+            self.node_get_boundary(&node.se, left + offset, top + offset, find_se, boundary);
         }
     }
 
@@ -572,7 +565,7 @@ impl LifeUniverse {
         let offset = self.pow2(self.root.level - 1);
 
         self.node_get_boundary(
-            self.root.clone(),
+            &self.root,
             -offset,
             -offset,
             MASK_LEFT | MASK_TOP | MASK_RIGHT | MASK_BOTTOM,
@@ -607,10 +600,10 @@ impl LifeUniverse {
     }
 
     fn node_level2_next(&mut self, node: Rc<TreeNode>) -> Rc<TreeNode> {
-        let nw = node.nw.clone();
-        let ne = node.ne.clone();
-        let sw = node.sw.clone();
-        let se = node.se.clone();
+        let nw = &node.nw;
+        let ne = &node.ne;
+        let sw = &node.sw;
+        let se = &node.se;
         let bitmask = nw.nw.population << 15
             | nw.ne.population << 14
             | ne.nw.population << 13
@@ -638,7 +631,7 @@ impl LifeUniverse {
 
     fn node_quick_next_generation(&mut self, node: Rc<TreeNode>) -> Rc<TreeNode> {
         if let Some(cached) = node.get_quick_cache() {
-            assert_eq!(cached.level, node.level - 1);
+            debug_assert_eq!(cached.level, node.level - 1);
             return cached;
         }
 
@@ -648,10 +641,10 @@ impl LifeUniverse {
             return new_node;
         }
 
-        let nw = node.nw.clone();
-        let ne = node.ne.clone();
-        let sw = node.sw.clone();
-        let se = node.se.clone();
+        let nw = &node.nw;
+        let ne = &node.ne;
+        let sw = &node.sw;
+        let se = &node.se;
         let n00 = self.node_quick_next_generation(nw.clone());
         let n01_tree = self.create_tree(nw.ne.clone(), ne.nw.clone(), nw.se.clone(), ne.sw.clone());
         let n01 = self.node_quick_next_generation(n01_tree);
@@ -679,7 +672,7 @@ impl LifeUniverse {
 
         let new_node = self.create_tree(nw_tree, ne_tree, sw_tree, se_tree);
 
-        assert_eq!(new_node.level, node.level - 1);
+        debug_assert_eq!(new_node.level, node.level - 1);
         node.quick_cache.set(Some(new_node.clone()));
         new_node
     }
@@ -703,10 +696,10 @@ impl LifeUniverse {
             }
         }
 
-        let nw = node.nw.clone();
-        let ne = node.ne.clone();
-        let sw = node.sw.clone();
-        let se = node.se.clone();
+        let nw = &node.nw;
+        let ne = &node.ne;
+        let sw = &node.sw;
+        let se = &node.se;
         let n00 = self.create_tree(
             nw.nw.se.clone(),
             nw.ne.sw.clone(),
@@ -796,13 +789,16 @@ impl LifeUniverse {
             root = self.expand_universe(root);
         }
 
-        if is_single {
+        // superstep button doesn't exist
+        /*if is_single {
             self.generation += self.pow2(self.step);
             root = self.node_next_generation(root);
         } else {
             self.generation += self.pow2(self.root.level - 2);
             root = self.node_quick_next_generation(root);
-        }
+        }*/
+        self.generation += self.pow2(self.step);
+        root = self.node_next_generation(root);
 
         // log(format!("Collision count: {}", unsafe { COLLISION_COUNT }).as_str());
 
