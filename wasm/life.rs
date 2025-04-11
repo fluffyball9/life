@@ -5,7 +5,6 @@ use std::mem::{self, MaybeUninit};
 use std::rc::Rc;
 use wasm_bindgen::prelude::wasm_bindgen;
 
-#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
 #[global_allocator]
 static A: rlsf::GlobalTlsf = rlsf::GlobalTlsf::new();
 

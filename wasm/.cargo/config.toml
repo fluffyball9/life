@@ -1,3 +1,7 @@
 [build]
-rustflags = ["-Zlocation-detail=none", "-Zfmt-debug=none"]
+rustflags = ["-Zlocation-detail=none", "-Zfmt-debug=none", "-Zwasm-c-abi=spec", "-Ctarget-feature=+bulk-memory,+extended-const,+mutable-globals,+nontrapping-fptoint,+relaxed-simd,+sign-ext,+multivalue,+reference-types,+tail-call"]
 target = "wasm32-unknown-unknown"
+
+[unstable]
+build-std = ["std", "panic_abort"]
+build-std-features = ["panic_immediate_abort"]
