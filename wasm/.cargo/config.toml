@@ -1,2 +1,3 @@
 [build]
 rustflags = ["-Zlocation-detail=none", "-Zfmt-debug=none"]
+target = "wasm32-unknown-unknown"
