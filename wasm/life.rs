@@ -8,8 +8,7 @@ use wasm_bindgen::prelude::wasm_bindgen;
 #[global_allocator]
 static A: rlsf::GlobalTlsf = rlsf::GlobalTlsf::new();
 
-const INITIAL_SIZE: usize = 15;
-const HASHMAP_LIMIT: usize = 22;
+const INITIAL_CAPACITY: usize = 10_000;
 const MASK_LEFT: usize = 1;
 const MASK_TOP: usize = 2;
 const MASK_RIGHT: usize = 4;
@@ -37,6 +36,7 @@ struct TreeNodeMaybeUninit {
     level: usize,
     cache: Cell<Option<Rc<TreeNodeMaybeUninit>>>,
     quick_cache: Cell<Option<Rc<TreeNodeMaybeUninit>>>,
+    in_tree: Cell<bool>,
 }
 
 #[repr(C)]
@@ -49,6 +49,7 @@ struct TreeNode {
     level: usize,
     cache: Cell<Option<Rc<TreeNode>>>,
     quick_cache: Cell<Option<Rc<TreeNode>>>,
+    in_tree: Cell<bool>,
 }
 
 impl PartialEq for TreeNode {
@@ -75,6 +76,7 @@ impl TreeNode {
             level: 0,
             cache: Cell::new(None),
             quick_cache: Cell::new(None),
+            in_tree: Cell::new(true),
         };
         new_node.level = new_node.nw.level + 1;
         // log(format!("Creating new node with level: {} and id: {}", new_node.level, id).as_str());
@@ -96,6 +98,7 @@ impl TreeNode {
             level: 0,
             cache: Cell::new(None),
             quick_cache: Cell::new(None),
+            in_tree: Cell::new(true),
         })) as *mut TreeNodeMaybeUninit;
         let new_leaf = unsafe {
             (*new_leaf).nw = MaybeUninit::new(Rc::from_raw(new_leaf));
@@ -139,9 +142,8 @@ struct Bounds {
 
 #[wasm_bindgen]
 struct LifeUniverse {
-    hashmap_size: usize,
     hashmap: HashMap<[usize; 4], Rc<TreeNode>, FxBuildHasher>,
-    empty_tree_cache: Vec<Option<Rc<TreeNode>>>,
+    empty_tree_cache: Vec<Rc<TreeNode>>,
     level2_cache: Vec<Option<Rc<TreeNode>>>,
     rule_b: usize,
     rule_s: usize,
@@ -151,12 +153,11 @@ struct LifeUniverse {
     generation: f64,
     false_leaf: Rc<TreeNode>,
     true_leaf: Rc<TreeNode>,
-    _powers: Vec<f64>,
 }
 
 #[wasm_bindgen]
 impl LifeUniverse {
-    fn get_key2(
+    fn get_key(
         nw: &Rc<TreeNode>,
         ne: &Rc<TreeNode>,
         sw: &Rc<TreeNode>,
@@ -170,111 +171,100 @@ impl LifeUniverse {
         ]
     }
 
-    fn get_key(n: &Rc<TreeNode>) -> [usize; 4] {
-        Self::get_key2(&n.nw, &n.ne, &n.sw, &n.se)
-    }
-
-    fn in_hashmap(&self, n: &Rc<TreeNode>) -> bool {
-        self.hashmap.contains_key(&Self::get_key(n))
-    }
-
-    fn node_hash(&mut self, node: Rc<TreeNode>) {
-        if !self.in_hashmap(&node) {
+    fn mark_node(node: &Rc<TreeNode>, in_tree: bool) {
+        if node.in_tree.get() != in_tree {
+            node.in_tree.set(in_tree);
             if node.level > 1 {
-                self.node_hash(node.nw.clone());
-                self.node_hash(node.ne.clone());
-                self.node_hash(node.sw.clone());
-                self.node_hash(node.se.clone());
+                Self::mark_node(&node.nw, in_tree);
+                Self::mark_node(&node.ne, in_tree);
+                Self::mark_node(&node.sw, in_tree);
+                Self::mark_node(&node.se, in_tree);
 
                 if let Some(cached) = node.get_cache() {
-                    self.node_hash(cached);
+                    Self::mark_node(&cached, in_tree);
                 }
 
                 if let Some(cached) = node.get_quick_cache() {
-                    self.node_hash(cached);
+                    Self::mark_node(&cached, in_tree);
                 }
             }
-
-            self.hashmap_insert(node);
         }
     }
 
     fn reset_caches(&mut self) {
-        self.empty_tree_cache.fill(None);
+        self.empty_tree_cache.clear();
         self.level2_cache.fill(None);
     }
 
-    fn garbage_collect(&mut self) {
+    fn garbage_collect(
+        hashmap: &mut HashMap<[usize; 4], Rc<TreeNode>, FxBuildHasher>,
+        root: &Rc<TreeNode>,
+    ) {
         // log(format!("Garbage collecting..., current hs_size: {}, last_id: {}", self.hashmap_size, self.last_id).as_str());
         // time("GC: reset hashmap");
 
-        self.hashmap.clear();
-        if self.hashmap_size < (1 << HASHMAP_LIMIT) - 1 {
-            self.hashmap_size = self.hashmap_size << 1 | 1;
-        }
-        self.hashmap
-            .reserve(self.hashmap_size.saturating_sub(self.hashmap.capacity()));
-        // timeEnd("GC: reset hashmap");
+        Self::mark_node(&root, true);
+        hashmap.retain(|_, v| v.in_tree.get()); // caches are one level lower so no memory leak
+        Self::mark_node(&root, false); // reset mark
 
-        // time("GC: rehashing nodes");
-        self.node_hash(self.root.clone());
-        // timeEnd("GC: rehashing nodes");
+        // resize if over half full
+        hashmap.reserve(
+            hashmap
+                .len()
+                .saturating_mul(2)
+                .saturating_sub(hashmap.capacity()),
+        );
+        // timeEnd("GC: reset hashmap");
 
         // log(format!("Garbage collection done..., new hs_size: {}, last_id: {}", self.hashmap_size, self.last_id).as_str());
     }
 
     fn create_tree(
-        &mut self,
-        nw: Rc<TreeNode>,
-        ne: Rc<TreeNode>,
-        sw: Rc<TreeNode>,
-        se: Rc<TreeNode>,
+        hashmap: &mut HashMap<[usize; 4], Rc<TreeNode>, FxBuildHasher>,
+        root: &Rc<TreeNode>,
+        nw: &Rc<TreeNode>,
+        ne: &Rc<TreeNode>,
+        sw: &Rc<TreeNode>,
+        se: &Rc<TreeNode>,
     ) -> Rc<TreeNode> {
         debug_assert_eq!(nw.level, ne.level);
         debug_assert_eq!(nw.level, sw.level);
         debug_assert_eq!(nw.level, se.level);
 
-        if self.hashmap.len() == self.hashmap_size {
-            self.garbage_collect();
-            return self.create_tree(nw, ne, sw, se);
+        if hashmap.len() == hashmap.capacity() {
+            Self::garbage_collect(hashmap, root);
         }
 
-        self.hashmap
-            .entry(Self::get_key2(&nw, &ne, &sw, &se))
-            .or_insert_with(|| TreeNode::new(nw, ne, sw, se))
+        hashmap
+            .entry(Self::get_key(nw, ne, sw, se))
+            .or_insert_with(|| TreeNode::new(nw.clone(), ne.clone(), sw.clone(), se.clone()))
             .clone()
     }
 
-    fn empty_tree(&mut self, level: usize) -> Rc<TreeNode> {
-        if self.empty_tree_cache.len() <= level {
-            self.empty_tree_cache.resize(level + 1, None);
-        } else if let Some(cached) = &self.empty_tree_cache[level] {
-            return cached.clone();
+    fn empty_tree<'a>(
+        empty_tree_cache: &'a mut Vec<Rc<TreeNode>>,
+        false_leaf: &Rc<TreeNode>,
+        hashmap: &mut HashMap<[usize; 4], Rc<TreeNode>, FxBuildHasher>,
+        root: &Rc<TreeNode>,
+        level: usize,
+    ) -> &'a Rc<TreeNode> {
+        for _ in empty_tree_cache.len()..=level {
+                if let Some(last) = empty_tree_cache.last() {
+                let new_node = Self::create_tree(hashmap, &root, last, last, last, last);
+                empty_tree_cache.push(new_node);
+            } else {
+                empty_tree_cache.push(false_leaf.clone());
+            }
         }
-
-        let t = if level == 1 {
-            self.false_leaf.clone()
-        } else {
-            self.empty_tree(level - 1)
-        };
-
-        // log(format!("Level of t is: {}", t.level).as_str());
-
-        let empty_tree = self.create_tree(t.clone(), t.clone(), t.clone(), t);
-
-        // log(format!("Empty tree requested level of: {}", level).as_str());
-        // log(format!("Empty tree created level of: {}", empty_tree.level).as_str());
-
-        self.empty_tree_cache[level].insert(empty_tree).clone()
+        &empty_tree_cache[level]
     }
 
     #[allow(dead_code)]
     pub fn clear_pattern(&mut self) {
-        self.hashmap_size = (1 << INITIAL_SIZE) - 1;
-        self.hashmap = HashMap::with_capacity_and_hasher(self.hashmap_size, Default::default());
-        self.empty_tree_cache.fill(None);
+        self.hashmap = HashMap::with_capacity_and_hasher(INITIAL_CAPACITY, Default::default());
+        self.empty_tree_cache.clear();
         self.level2_cache = vec![None; 0x10000];
-        self.root = self.empty_tree(3);
+        self.root = Self::empty_tree(&mut self.empty_tree_cache, &self.false_leaf, &mut self.hashmap, &self.root, 3).clone();
         self.generation = 0.0;
         // log("Clearing pattern...");
     }
@@ -283,16 +273,10 @@ impl LifeUniverse {
     #[allow(dead_code)]
     pub fn new() -> LifeUniverse {
         // log("Starting constructor...");
-        let mut powers = vec![0.0; 1024];
-        powers[0] = 1.0;
-        for i in 1..1024 {
-            powers[i] = powers[i - 1] * 2.0;
-        }
         // log("Creating object...");
         let false_leaf = TreeNode::new_leaf(0);
         let true_leaf = TreeNode::new_leaf(1);
         let mut ret = LifeUniverse {
-            hashmap_size: 0,
             hashmap: HashMap::default(),
             empty_tree_cache: vec![],
             level2_cache: vec![],
@@ -304,7 +288,6 @@ impl LifeUniverse {
             step: 0,
             false_leaf: false_leaf,
             true_leaf: true_leaf,
-            _powers: powers,
         };
         // log("Clearing pattern...");
         ret.clear_pattern();
@@ -312,11 +295,8 @@ impl LifeUniverse {
         ret
     }
 
-    fn pow2(&self, x: usize) -> f64 {
-        if x >= 1024 {
-            return f64::INFINITY;
-        }
-        self._powers[x as usize]
+    fn pow2(x: usize) -> f64 {
+        2_f64.powi(x.try_into().unwrap_or(i32::MAX))
     }
 
     #[allow(dead_code)]
@@ -329,8 +309,7 @@ impl LifeUniverse {
         if let Some(rewind_state) = &self.rewind_state {
             self.generation = 0.0;
             self.root = rewind_state.clone();
-
-            self.garbage_collect();
+            Self::garbage_collect(&mut self.hashmap, &self.root);
         }
     }
 
@@ -350,26 +329,30 @@ impl LifeUniverse {
     }
 
     fn level1_create(&mut self, mask: usize) -> Rc<TreeNode> {
-        self.create_tree(
+        let true_leaf = self.true_leaf.clone();
+        let false_leaf = self.false_leaf.clone();
+        Self::create_tree(
+            &mut self.hashmap,
+            &self.root,
             if mask & 1 != 0 {
-                self.true_leaf.clone()
+                &true_leaf
             } else {
-                self.false_leaf.clone()
+                &false_leaf
             },
             if mask & 2 != 0 {
-                self.true_leaf.clone()
+                &true_leaf
             } else {
-                self.false_leaf.clone()
+                &false_leaf
             },
             if mask & 4 != 0 {
-                self.true_leaf.clone()
+                &true_leaf
             } else {
-                self.false_leaf.clone()
+                &false_leaf
             },
             if mask & 8 != 0 {
-                self.true_leaf.clone()
+                &true_leaf
             } else {
-                self.false_leaf.clone()
+                &false_leaf
             },
         )
     }
@@ -388,7 +371,7 @@ impl LifeUniverse {
         max.log2().ceil() as usize + 1
     }
 
-    fn node_set_bit(&mut self, node: Rc<TreeNode>, x: f64, y: f64, living: bool) -> Rc<TreeNode> {
+    fn node_set_bit(&mut self, node: &Rc<TreeNode>, x: f64, y: f64, living: bool) -> Rc<TreeNode> {
         if node.level == 0 {
             return if living {
                 self.true_leaf.clone()
@@ -400,28 +383,34 @@ impl LifeUniverse {
         let offset = if node.level == 1 {
             0.0
         } else {
-            self.pow2(node.level - 2)
+            Self::pow2(node.level - 2)
         };
-        let mut nw = node.nw.clone();
-        let mut ne = node.ne.clone();
-        let mut sw = node.sw.clone();
-        let mut se = node.se.clone();
+
+        let changed: Rc<TreeNode>;
+        let mut nw = &node.nw;
+        let mut ne = &node.ne;
+        let mut sw = &node.sw;
+        let mut se = &node.se;
 
         if x < 0.0 {
             if y < 0.0 {
-                nw = self.node_set_bit(nw, x + offset, y + offset, living);
+                changed = self.node_set_bit(&nw, x + offset, y + offset, living);
+                nw = &changed;
             } else {
-                sw = self.node_set_bit(sw, x + offset, y - offset, living);
+                changed = self.node_set_bit(&sw, x + offset, y - offset, living);
+                sw = &changed;
             }
         } else {
             if y < 0.0 {
-                ne = self.node_set_bit(ne, x - offset, y + offset, living);
+                changed = self.node_set_bit(&ne, x - offset, y + offset, living);
+                ne = &changed;
             } else {
-                se = self.node_set_bit(se, x - offset, y - offset, living);
+                changed = self.node_set_bit(&se, x - offset, y - offset, living);
+                se = &changed;
             }
         }
 
-        self.create_tree(nw, ne, sw, se)
+        Self::create_tree(&mut self.hashmap, &self.root, nw, ne, sw, se)
     }
 
     fn node_get_bit(&self, node: &Rc<TreeNode>, x: f64, y: f64) -> bool {
@@ -436,7 +425,7 @@ impl LifeUniverse {
         let offset = if node.level == 1 {
             0.0
         } else {
-            self.pow2(node.level - 2)
+            Self::pow2(node.level - 2)
         };
 
         if x < 0.0 {
@@ -468,7 +457,7 @@ impl LifeUniverse {
             return;
         }
 
-        self.root = self.node_set_bit(self.root.clone(), x, y, living);
+        self.root = self.node_set_bit(&self.root.clone(), x, y, living);
     }
 
     #[allow(dead_code)]
@@ -509,7 +498,7 @@ impl LifeUniverse {
                 boundary[3] = top;
             }
         } else {
-            let offset = self.pow2(node.level - 1);
+            let offset = Self::pow2(node.level - 1);
 
             if left >= boundary[0]
                 && left + offset * 2.0 <= boundary[1]
@@ -565,7 +554,7 @@ impl LifeUniverse {
             f64::INFINITY,     // top
             f64::NEG_INFINITY, // bottom
         ];
-        let offset = self.pow2(self.root.level - 1);
+        let offset = Self::pow2(self.root.level - 1);
 
         self.node_get_boundary(
             &self.root,
@@ -580,13 +569,14 @@ impl LifeUniverse {
 
     fn expand_universe(&mut self, node: Rc<TreeNode>) -> Rc<TreeNode> {
         let level = node.level;
-        let t = self.empty_tree(level - 1);
-        let nw = self.create_tree(t.clone(), t.clone(), t.clone(), node.nw.clone());
-        let ne = self.create_tree(t.clone(), t.clone(), node.ne.clone(), t.clone());
-        let sw = self.create_tree(t.clone(), node.sw.clone(), t.clone(), t.clone());
-        let se = self.create_tree(node.se.clone(), t.clone(), t.clone(), t.clone());
+        let hashmap = &mut self.hashmap;
+        let t = Self::empty_tree(&mut self.empty_tree_cache, &self.false_leaf, hashmap, &self.root, level - 1);
+        let nw = Self::create_tree(hashmap, &self.root, &t, &t, &t, &node.nw);
+        let ne = Self::create_tree(hashmap, &self.root, &t, &t, &node.ne, &t);
+        let sw = Self::create_tree(hashmap, &self.root, &t, &node.sw, &t, &t);
+        let se = Self::create_tree(hashmap, &self.root, &node.se, &t, &t, &t);
 
-        self.create_tree(nw, ne, sw, se)
+        Self::create_tree(&mut self.hashmap, &self.root, &nw, &ne, &sw, &se)
     }
 
     fn uncache(&mut self, also_quick: bool) {
@@ -598,11 +588,7 @@ impl LifeUniverse {
         }
     }
 
-    fn hashmap_insert(&mut self, n: Rc<TreeNode>) {
-        self.hashmap.insert(Self::get_key(&n), n);
-    }
-
-    fn node_level2_next(&mut self, node: Rc<TreeNode>) -> Rc<TreeNode> {
+    fn node_level2_next(&mut self, node: &Rc<TreeNode>) -> Rc<TreeNode> {
         let nw = &node.nw;
         let ne = &node.ne;
         let sw = &node.sw;
@@ -632,14 +618,14 @@ impl LifeUniverse {
         )
     }
 
-    fn node_quick_next_generation(&mut self, node: Rc<TreeNode>) -> Rc<TreeNode> {
+    fn node_quick_next_generation(&mut self, node: &Rc<TreeNode>) -> Rc<TreeNode> {
         if let Some(cached) = node.get_quick_cache() {
             debug_assert_eq!(cached.level, node.level - 1);
             return cached;
         }
 
         if node.level == 2 {
-            let new_node = self.node_level2_next(node.clone());
+            let new_node = self.node_level2_next(&node);
             node.quick_cache.set(Some(new_node.clone()));
             return new_node;
         }
@@ -648,52 +634,98 @@ impl LifeUniverse {
         let ne = &node.ne;
         let sw = &node.sw;
         let se = &node.se;
-        let n00 = self.node_quick_next_generation(nw.clone());
-        let n01_tree = self.create_tree(nw.ne.clone(), ne.nw.clone(), nw.se.clone(), ne.sw.clone());
-        let n01 = self.node_quick_next_generation(n01_tree);
-        let n02 = self.node_quick_next_generation(ne.clone());
-        let n10_tree = self.create_tree(nw.sw.clone(), nw.se.clone(), sw.nw.clone(), sw.ne.clone());
-        let n10 = self.node_quick_next_generation(n10_tree);
-        let n11_tree = self.create_tree(nw.se.clone(), ne.sw.clone(), sw.ne.clone(), se.nw.clone());
-        let n11 = self.node_quick_next_generation(n11_tree);
-        let n12_tree = self.create_tree(ne.sw.clone(), ne.se.clone(), se.nw.clone(), se.ne.clone());
-        let n12 = self.node_quick_next_generation(n12_tree);
-        let n20 = self.node_quick_next_generation(sw.clone());
-        let n21_tree = self.create_tree(sw.ne.clone(), se.nw.clone(), sw.se.clone(), se.sw.clone());
-        let n21 = self.node_quick_next_generation(n21_tree);
-        let n22 = self.node_quick_next_generation(se.clone());
+        let n00 = self.node_quick_next_generation(&nw);
+        let n01_tree = Self::create_tree(
+            &mut self.hashmap,
+            &self.root,
+            &nw.ne,
+            &ne.nw,
+            &nw.se,
+            &ne.sw,
+        );
+        let n01 = self.node_quick_next_generation(&n01_tree);
+        let n02 = self.node_quick_next_generation(&ne);
+        let n10_tree = Self::create_tree(
+            &mut self.hashmap,
+            &self.root,
+            &nw.sw,
+            &nw.se,
+            &sw.nw,
+            &sw.ne,
+        );
+        let n10 = self.node_quick_next_generation(&n10_tree);
+        let n11_tree = Self::create_tree(
+            &mut self.hashmap,
+            &self.root,
+            &nw.se,
+            &ne.sw,
+            &sw.ne,
+            &se.nw,
+        );
+        let n11 = self.node_quick_next_generation(&n11_tree);
+        let n12_tree = Self::create_tree(
+            &mut self.hashmap,
+            &self.root,
+            &ne.sw,
+            &ne.se,
+            &se.nw,
+            &se.ne,
+        );
+        let n12 = self.node_quick_next_generation(&n12_tree);
+        let n20 = self.node_quick_next_generation(&sw);
+        let n21_tree = Self::create_tree(
+            &mut self.hashmap,
+            &self.root,
+            &sw.ne,
+            &se.nw,
+            &sw.se,
+            &se.sw,
+        );
+        let n21 = self.node_quick_next_generation(&n21_tree);
+        let n22 = self.node_quick_next_generation(&se);
 
-        let n00_n01_n10_n11 = self.create_tree(n00, n01.clone(), n10.clone(), n11.clone());
-        let n01_n02_n11_n12 = self.create_tree(n01, n02, n11.clone(), n12.clone());
-        let n10_n11_n20_n21 = self.create_tree(n10, n11.clone(), n20, n21.clone());
-        let n11_n12_n21_n22 = self.create_tree(n11, n12, n21, n22);
+        let n00_n01_n10_n11 =
+            Self::create_tree(&mut self.hashmap, &self.root, &n00, &n01, &n10, &n11);
+        let n01_n02_n11_n12 =
+            Self::create_tree(&mut self.hashmap, &self.root, &n01, &n02, &n11, &n12);
+        let n10_n11_n20_n21 =
+            Self::create_tree(&mut self.hashmap, &self.root, &n10, &n11, &n20, &n21);
+        let n11_n12_n21_n22 =
+            Self::create_tree(&mut self.hashmap, &self.root, &n11, &n12, &n21, &n22);
 
-        let nw_tree = self.node_quick_next_generation(n00_n01_n10_n11);
-        let ne_tree = self.node_quick_next_generation(n01_n02_n11_n12);
-        let sw_tree = self.node_quick_next_generation(n10_n11_n20_n21);
-        let se_tree = self.node_quick_next_generation(n11_n12_n21_n22);
+        let nw_tree = self.node_quick_next_generation(&n00_n01_n10_n11);
+        let ne_tree = self.node_quick_next_generation(&n01_n02_n11_n12);
+        let sw_tree = self.node_quick_next_generation(&n10_n11_n20_n21);
+        let se_tree = self.node_quick_next_generation(&n11_n12_n21_n22);
 
-        let new_node = self.create_tree(nw_tree, ne_tree, sw_tree, se_tree);
+        let new_node = Self::create_tree(
+            &mut self.hashmap,
+            &self.root,
+            &nw_tree,
+            &ne_tree,
+            &sw_tree,
+            &se_tree,
+        );
 
         debug_assert_eq!(new_node.level, node.level - 1);
         node.quick_cache.set(Some(new_node.clone()));
         new_node
     }
 
-    fn node_next_generation(&mut self, node: Rc<TreeNode>) -> Rc<TreeNode> {
+    fn node_next_generation(&mut self, node: &Rc<TreeNode>) -> Rc<TreeNode> {
         if let Some(cached) = node.get_cache() {
             return cached;
         }
 
         if self.step == node.level - 2 {
-            return self.node_quick_next_generation(node);
+            return self.node_quick_next_generation(&node);
         }
 
         if node.level == 2 {
             if let Some(cached) = node.get_quick_cache() {
                 return cached;
             } else {
-                let new_node = self.node_level2_next(node.clone());
+                let new_node = self.node_level2_next(&node);
                 node.quick_cache.set(Some(new_node.clone()));
                 return new_node;
             }
@@ -703,74 +735,103 @@ impl LifeUniverse {
         let ne = &node.ne;
         let sw = &node.sw;
         let se = &node.se;
-        let n00 = self.create_tree(
-            nw.nw.se.clone(),
-            nw.ne.sw.clone(),
-            nw.sw.ne.clone(),
-            nw.se.nw.clone(),
+        let n00 = Self::create_tree(
+            &mut self.hashmap,
+            &self.root,
+            &nw.nw.se,
+            &nw.ne.sw,
+            &nw.sw.ne,
+            &nw.se.nw,
         );
-        let n01 = self.create_tree(
-            nw.ne.se.clone(),
-            ne.nw.sw.clone(),
-            nw.se.ne.clone(),
-            ne.sw.nw.clone(),
+        let n01 = Self::create_tree(
+            &mut self.hashmap,
+            &self.root,
+            &nw.ne.se,
+            &ne.nw.sw,
+            &nw.se.ne,
+            &ne.sw.nw,
         );
-        let n02 = self.create_tree(
-            ne.nw.se.clone(),
-            ne.ne.sw.clone(),
-            ne.sw.ne.clone(),
-            ne.se.nw.clone(),
+        let n02 = Self::create_tree(
+            &mut self.hashmap,
+            &self.root,
+            &ne.nw.se,
+            &ne.ne.sw,
+            &ne.sw.ne,
+            &ne.se.nw,
         );
-        let n10 = self.create_tree(
-            nw.sw.se.clone(),
-            nw.se.sw.clone(),
-            sw.nw.ne.clone(),
-            sw.ne.nw.clone(),
+        let n10 = Self::create_tree(
+            &mut self.hashmap,
+            &self.root,
+            &nw.sw.se,
+            &nw.se.sw,
+            &sw.nw.ne,
+            &sw.ne.nw,
         );
-        let n11 = self.create_tree(
-            nw.se.se.clone(),
-            ne.sw.sw.clone(),
-            sw.ne.ne.clone(),
-            se.nw.nw.clone(),
+        let n11 = Self::create_tree(
+            &mut self.hashmap,
+            &self.root,
+            &nw.se.se,
+            &ne.sw.sw,
+            &sw.ne.ne,
+            &se.nw.nw,
         );
-        let n12 = self.create_tree(
-            ne.sw.se.clone(),
-            ne.se.sw.clone(),
-            se.nw.ne.clone(),
-            se.ne.nw.clone(),
+        let n12 = Self::create_tree(
+            &mut self.hashmap,
+            &self.root,
+            &ne.sw.se,
+            &ne.se.sw,
+            &se.nw.ne,
+            &se.ne.nw,
         );
-        let n20 = self.create_tree(
-            sw.nw.se.clone(),
-            sw.ne.sw.clone(),
-            sw.sw.ne.clone(),
-            sw.se.nw.clone(),
+        let n20 = Self::create_tree(
+            &mut self.hashmap,
+            &self.root,
+            &sw.nw.se,
+            &sw.ne.sw,
+            &sw.sw.ne,
+            &sw.se.nw,
         );
-        let n21 = self.create_tree(
-            sw.ne.se.clone(),
-            se.nw.sw.clone(),
-            sw.se.ne.clone(),
-            se.sw.nw.clone(),
+        let n21 = Self::create_tree(
+            &mut self.hashmap,
+            &self.root,
+            &sw.ne.se,
+            &se.nw.sw,
+            &sw.se.ne,
+            &se.sw.nw,
         );
-        let n22 = self.create_tree(
-            se.nw.se.clone(),
-            se.ne.sw.clone(),
-            se.sw.ne.clone(),
-            se.se.nw.clone(),
+        let n22 = Self::create_tree(
+            &mut self.hashmap,
+            &self.root,
+            &se.nw.se,
+            &se.ne.sw,
+            &se.sw.ne,
+            &se.se.nw,
         );
 
         //debug_assert!(n00.level == n01.level && n00.level == n02.level && n00.level == n10.level && n00.level == n11.level && n00.level == n12.level && n00.level == n20.level && n00.level == n21.level && n00.level == n22.level);
 
-        let n00_n01_n10_n11 = self.create_tree(n00, n01.clone(), n10.clone(), n11.clone());
-        let n01_n02_n11_n12 = self.create_tree(n01, n02, n11.clone(), n12.clone());
-        let n10_n11_n20_n21 = self.create_tree(n10, n11.clone(), n20, n21.clone());
-        let n11_n12_n21_n22 = self.create_tree(n11, n12, n21, n22);
+        let n00_n01_n10_n11 =
+            Self::create_tree(&mut self.hashmap, &self.root, &n00, &n01, &n10, &n11);
+        let n01_n02_n11_n12 =
+            Self::create_tree(&mut self.hashmap, &self.root, &n01, &n02, &n11, &n12);
+        let n10_n11_n20_n21 =
+            Self::create_tree(&mut self.hashmap, &self.root, &n10, &n11, &n20, &n21);
+        let n11_n12_n21_n22 =
+            Self::create_tree(&mut self.hashmap, &self.root, &n11, &n12, &n21, &n22);
 
-        let nw_tree = self.node_next_generation(n00_n01_n10_n11);
-        let ne_tree = self.node_next_generation(n01_n02_n11_n12);
-        let sw_tree = self.node_next_generation(n10_n11_n20_n21);
-        let se_tree = self.node_next_generation(n11_n12_n21_n22);
+        let nw_tree = self.node_next_generation(&n00_n01_n10_n11);
+        let ne_tree = self.node_next_generation(&n01_n02_n11_n12);
+        let sw_tree = self.node_next_generation(&n10_n11_n20_n21);
+        let se_tree = self.node_next_generation(&n11_n12_n21_n22);
 
-        let new_node = self.create_tree(nw_tree, ne_tree, sw_tree, se_tree);
+        let new_node = Self::create_tree(
+            &mut self.hashmap,
+            &self.root,
+            &nw_tree,
+            &ne_tree,
+            &sw_tree,
+            &se_tree,
+        );
 
         node.cache.set(Some(new_node.clone()));
         new_node
@@ -794,14 +855,14 @@ impl LifeUniverse {
 
         // superstep button doesn't exist
         /*if is_single {
-            self.generation += self.pow2(self.step);
+            self.generation += Self::pow2(self.step);
             root = self.node_next_generation(root);
         } else {
-            self.generation += self.pow2(self.root.level - 2);
+            self.generation += Self::pow2(self.root.level - 2);
             root = self.node_quick_next_generation(root);
         }*/
-        self.generation += self.pow2(self.step);
-        root = self.node_next_generation(root);
+        self.generation += Self::pow2(self.step);
+        root = self.node_next_generation(&root);
 
         // log(format!("Collision count: {}", unsafe { COLLISION_COUNT }).as_str());
 
@@ -915,7 +976,7 @@ impl LifeUniverse {
             let sw = self.level1_create(set >> 8);
             let se = self.level1_create(set >> 12);
 
-            let new_node = self.create_tree(nw, ne, sw, se);
+            let new_node = Self::create_tree(&mut self.hashmap, &self.root, &nw, &ne, &sw, &se);
 
             self.level2_cache[set].insert(new_node).clone()
         }
@@ -933,7 +994,7 @@ impl LifeUniverse {
         if start > end || end == usize::MAX
         /* wrapped around */
         {
-            return self.empty_tree(level);
+            return Self::empty_tree(&mut self.empty_tree_cache, &self.false_leaf, &mut self.hashmap, &self.root, level).clone();
         }
 
         if level == 2 {
@@ -958,7 +1019,7 @@ impl LifeUniverse {
 
         // log("From recurse: creating tree...");
 
-        self.create_tree(nw, ne, sw, se)
+        Self::create_tree(&mut self.hashmap, &self.root, &nw, &ne, &sw, &se)
     }
 
     #[allow(dead_code)]

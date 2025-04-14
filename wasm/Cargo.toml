@@ -20,7 +20,7 @@ incremental = false
 opt-level = 3
 
 [package.metadata.wasm-pack.profile.profiling]
-wasm-opt = ["-all", "-O4", "-g"]
+wasm-opt = ["-O4", "-g"]
 
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = ["-all", "-O4"]
+wasm-opt = ["-O4", "--strip-producers", "--strip-target-features"]
